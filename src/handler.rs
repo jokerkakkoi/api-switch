@@ -53,7 +53,6 @@ pub async fn messages_handler(
     let creds = lookup_token(&state.config, token)
         .ok_or_else(|| AppError::AuthenticationError("Invalid bearer token".into()))?;
 
-    tracing::info!("收到请求!");
     // 3. Parse Anthropic request
     let anthropic_req: AnthropicRequest = serde_json::from_str(&body)
         .map_err(|e| AppError::InvalidRequestError(format!("Invalid request body: {}", e)))?;
@@ -66,7 +65,7 @@ pub async fn messages_handler(
     // 5. Build forwarded headers: keep all except Authorization, add App-Key + App-Sign
     let mut fwd_headers = HeaderMap::new();
     for (key, value) in headers.iter() {
-        if key.as_str().to_lowercase() != "authorization" {
+        if !SKIP_HEADERS.contains(&key.as_str()) {
             fwd_headers.insert(key, value.clone());
         }
     }
@@ -87,11 +86,6 @@ pub async fn messages_handler(
         state.base_url.trim_end_matches('/'),
         OPENAI_CHAT_PATH
     );
-    for (key, value) in headers.iter() {
-        if !SKIP_HEADERS.contains(&key.as_str().to_lowercase().as_str()) {
-            fwd_headers.insert(key, value.clone());
-        }
-    }
     tracing::info!("开始请求{}", &backend_url);
     let request = state
         .client
@@ -120,7 +114,6 @@ async fn handle_non_stream_response(
 ) -> Result<Response, AppError> {
     let response = request.send().await?;
     let status = response.status();
-    tracing::info!("请求结束");
     if status.is_success() {
         let openai_resp: crate::openai::OpenAIResponse = response
             .json()

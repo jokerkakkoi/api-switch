@@ -6,7 +6,9 @@
       "Bash(grep -i \"worktree\" CLAUDE.md)",
       "Bash(cargo build *)",
       "Bash(cargo test *)",
-      "Bash(cat .gitignore)"
+      "Bash(cat .gitignore)",
+      "Bash(git branch *)",
+      "Bash(git worktree *)"
     ]
   }
 }
