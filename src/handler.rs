@@ -19,6 +19,19 @@ use crate::transform::stream::{StreamState, convert_stream_chunk, format_sse};
 
 const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 
+const SKIP_HEADERS: &[&str] = &[
+    "authorization",
+    "content-length", // ← 加这个，让 reqwest 自动计算
+    "content-type",   // ← 加这个，让 .json() 自己设
+    "host",           // ← 加这个，避免路由错误
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "te",
+    "trailers",
+    "upgrade",
+];
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
@@ -40,6 +53,7 @@ pub async fn messages_handler(
     let creds = lookup_token(&state.config, token)
         .ok_or_else(|| AppError::AuthenticationError("Invalid bearer token".into()))?;
 
+    tracing::info!("收到请求!");
     // 3. Parse Anthropic request
     let anthropic_req: AnthropicRequest = serde_json::from_str(&body)
         .map_err(|e| AppError::InvalidRequestError(format!("Invalid request body: {}", e)))?;
@@ -73,12 +87,17 @@ pub async fn messages_handler(
         state.base_url.trim_end_matches('/'),
         OPENAI_CHAT_PATH
     );
+    for (key, value) in headers.iter() {
+        if !SKIP_HEADERS.contains(&key.as_str().to_lowercase().as_str()) {
+            fwd_headers.insert(key, value.clone());
+        }
+    }
+    tracing::info!("开始请求{}", &backend_url);
     let request = state
         .client
         .post(&backend_url)
         .headers(fwd_headers)
         .json(&openai_req);
-
     if is_stream {
         handle_stream_response(request).await
     } else {
@@ -101,7 +120,7 @@ async fn handle_non_stream_response(
 ) -> Result<Response, AppError> {
     let response = request.send().await?;
     let status = response.status();
-
+    tracing::info!("请求结束");
     if status.is_success() {
         let openai_resp: crate::openai::OpenAIResponse = response
             .json()
@@ -179,7 +198,24 @@ async fn handle_stream_response(request: reqwest::RequestBuilder) -> Result<Resp
     Ok(Sse::new(stream).into_response())
 }
 
-/// GET /health
-pub async fn health_handler() -> &'static str {
-    "ok"
+/// GET /health — proxy health check to the configured backend
+pub async fn health_handler(State(state): State<AppState>) -> Result<Response, AppError> {
+    let backend_url = format!("{}/health", state.base_url.trim_end_matches('/'));
+
+    let response = state
+        .client
+        .get(&backend_url)
+        .send()
+        .await
+        .map_err(|e| AppError::ApiError(format!("Health check failed: {}", e)))?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    Ok((
+        axum::http::StatusCode::from_u16(status.as_u16())
+            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+        body,
+    )
+        .into_response())
 }
