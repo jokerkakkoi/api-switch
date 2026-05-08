@@ -1,4 +1,0 @@
-tokens:
-  sk-ant-example-token:
-    app_key: "sk-your-openai-api-key"
-    app_sign: "your-app-sign-value"

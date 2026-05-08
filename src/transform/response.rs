@@ -11,9 +11,7 @@ pub fn convert_response(resp: OpenAIResponse) -> AnthropicResponse {
     // Convert text content
     if let Some(ref text) = choice.message.content {
         if !text.is_empty() {
-            content.push(AnthropicResponseContentBlock::Text {
-                text: text.clone(),
-            });
+            content.push(AnthropicResponseContentBlock::Text { text: text.clone() });
         }
     }
 

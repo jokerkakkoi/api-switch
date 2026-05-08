@@ -192,8 +192,11 @@ pub fn convert_stream_chunk(
                 }
 
                 let stop_reason = map_stop_reason(finish_reason);
-                let output_tokens =
-                    chunk.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
+                let output_tokens = chunk
+                    .usage
+                    .as_ref()
+                    .map(|u| u.completion_tokens)
+                    .unwrap_or(0);
 
                 events.push(AnthropicSSEEvent::MessageDelta {
                     delta: MessageDeltaData {
@@ -508,24 +511,45 @@ mod tests {
         // 1. Role chunk
         let c1 = make_chunk(Some("assistant"), None, None, Some("gpt-4"), None, None);
         let e1 = convert_stream_chunk(&c1, &mut state);
-        assert!(e1.iter().any(|e| matches!(e, AnthropicSSEEvent::MessageStart { .. })));
-        assert!(e1.iter().any(|e| matches!(e, AnthropicSSEEvent::ContentBlockStart { .. })));
+        assert!(
+            e1.iter()
+                .any(|e| matches!(e, AnthropicSSEEvent::MessageStart { .. }))
+        );
+        assert!(
+            e1.iter()
+                .any(|e| matches!(e, AnthropicSSEEvent::ContentBlockStart { .. }))
+        );
 
         // 2. Content deltas
         let c2 = make_chunk(None, Some("Hello"), None, None, None, None);
         let e2 = convert_stream_chunk(&c2, &mut state);
-        assert!(e2.iter().any(|e| matches!(e, AnthropicSSEEvent::ContentBlockDelta { .. })));
+        assert!(
+            e2.iter()
+                .any(|e| matches!(e, AnthropicSSEEvent::ContentBlockDelta { .. }))
+        );
 
         let c3 = make_chunk(None, Some(" world"), None, None, None, None);
         let e3 = convert_stream_chunk(&c3, &mut state);
-        assert!(e3.iter().any(|e| matches!(e, AnthropicSSEEvent::ContentBlockDelta { .. })));
+        assert!(
+            e3.iter()
+                .any(|e| matches!(e, AnthropicSSEEvent::ContentBlockDelta { .. }))
+        );
 
         // 3. Finish
         let c4 = make_chunk(None, None, Some("stop"), None, None, None);
         let e4 = convert_stream_chunk(&c4, &mut state);
-        assert!(e4.iter().any(|e| matches!(e, AnthropicSSEEvent::ContentBlockStop { .. })));
-        assert!(e4.iter().any(|e| matches!(e, AnthropicSSEEvent::MessageDelta { .. })));
-        assert!(e4.iter().any(|e| matches!(e, AnthropicSSEEvent::MessageStop)));
+        assert!(
+            e4.iter()
+                .any(|e| matches!(e, AnthropicSSEEvent::ContentBlockStop { .. }))
+        );
+        assert!(
+            e4.iter()
+                .any(|e| matches!(e, AnthropicSSEEvent::MessageDelta { .. }))
+        );
+        assert!(
+            e4.iter()
+                .any(|e| matches!(e, AnthropicSSEEvent::MessageStop))
+        );
     }
 
     // Helper

@@ -1,21 +1,21 @@
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response, Sse};
-use axum::Json;
 use reqwest::Client;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::anthropic::AnthropicRequest;
-use crate::config::{lookup_token, AppConfig};
+use crate::config::{AppConfig, lookup_token};
 use crate::error::AppError;
 use crate::openai::OpenAISSEChunk;
 use crate::transform::request::convert_request;
 use crate::transform::response::{convert_response, map_openai_error};
-use crate::transform::stream::{convert_stream_chunk, format_sse, StreamState};
+use crate::transform::stream::{StreamState, convert_stream_chunk, format_sse};
 
 const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 
@@ -68,7 +68,11 @@ pub async fn messages_handler(
     );
 
     // 6. Send request to backend
-    let backend_url = format!("{}{}", state.base_url.trim_end_matches('/'), OPENAI_CHAT_PATH);
+    let backend_url = format!(
+        "{}{}",
+        state.base_url.trim_end_matches('/'),
+        OPENAI_CHAT_PATH
+    );
     let request = state
         .client
         .post(&backend_url)
@@ -113,9 +117,7 @@ async fn handle_non_stream_response(
 }
 
 /// Handle streaming SSE response: read OpenAI SSE stream, convert to Anthropic SSE, stream to client.
-async fn handle_stream_response(
-    request: reqwest::RequestBuilder,
-) -> Result<Response, AppError> {
+async fn handle_stream_response(request: reqwest::RequestBuilder) -> Result<Response, AppError> {
     let response = request.send().await?;
     let status = response.status();
 
@@ -153,9 +155,7 @@ async fn handle_stream_response(
                             if data_str == "[DONE]" {
                                 continue;
                             }
-                            if let Ok(chunk) =
-                                serde_json::from_str::<OpenAISSEChunk>(data_str)
-                            {
+                            if let Ok(chunk) = serde_json::from_str::<OpenAISSEChunk>(data_str) {
                                 let events = convert_stream_chunk(&chunk, &mut state);
                                 for event in events {
                                     let sse_event = axum::response::sse::Event::default()

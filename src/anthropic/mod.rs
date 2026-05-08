@@ -41,13 +41,9 @@ pub enum AnthropicContent {
 #[serde(tag = "type")]
 pub enum AnthropicContentBlock {
     #[serde(rename = "text")]
-    Text {
-        text: String,
-    },
+    Text { text: String },
     #[serde(rename = "image")]
-    Image {
-        source: ImageSource,
-    },
+    Image { source: ImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -164,23 +160,16 @@ pub struct AnthropicUsage {
 #[serde(tag = "type")]
 pub enum AnthropicSSEEvent {
     #[serde(rename = "message_start")]
-    MessageStart {
-        message: AnthropicStreamMessage,
-    },
+    MessageStart { message: AnthropicStreamMessage },
     #[serde(rename = "content_block_start")]
     ContentBlockStart {
         index: u32,
         content_block: AnthropicResponseContentBlock,
     },
     #[serde(rename = "content_block_delta")]
-    ContentBlockDelta {
-        index: u32,
-        delta: ContentDelta,
-    },
+    ContentBlockDelta { index: u32, delta: ContentDelta },
     #[serde(rename = "content_block_stop")]
-    ContentBlockStop {
-        index: u32,
-    },
+    ContentBlockStop { index: u32 },
     #[serde(rename = "message_delta")]
     MessageDelta {
         delta: MessageDeltaData,

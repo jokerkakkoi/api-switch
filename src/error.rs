@@ -1,6 +1,6 @@
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Serialize;
 
 #[derive(Debug)]
@@ -29,18 +29,22 @@ struct AnthropicErrorDetail {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, error_type, message) = match &self {
-            AppError::AuthenticationError(msg) => {
-                (StatusCode::UNAUTHORIZED, "authentication_error", msg.clone())
-            }
-            AppError::InvalidRequestError(msg) => {
-                (StatusCode::BAD_REQUEST, "invalid_request_error", msg.clone())
-            }
-            AppError::RateLimitError(msg) => {
-                (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", msg.clone())
-            }
-            AppError::ApiError(msg) => {
-                (StatusCode::BAD_GATEWAY, "api_error", msg.clone())
-            }
+            AppError::AuthenticationError(msg) => (
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                msg.clone(),
+            ),
+            AppError::InvalidRequestError(msg) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                msg.clone(),
+            ),
+            AppError::RateLimitError(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                msg.clone(),
+            ),
+            AppError::ApiError(msg) => (StatusCode::BAD_GATEWAY, "api_error", msg.clone()),
             AppError::TimeoutError(msg) => {
                 (StatusCode::GATEWAY_TIMEOUT, "timeout_error", msg.clone())
             }

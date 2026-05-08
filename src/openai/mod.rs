@@ -284,7 +284,10 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call_abc123");
         assert_eq!(tool_calls[0].function.name, "get_weather");
-        assert_eq!(resp.choices[0].finish_reason.as_ref().unwrap(), "tool_calls");
+        assert_eq!(
+            resp.choices[0].finish_reason.as_ref().unwrap(),
+            "tool_calls"
+        );
     }
 
     #[test]
@@ -322,7 +325,13 @@ mod tests {
         let tool_calls = choices[0].delta.tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls[0].id.as_ref().unwrap(), "call_xyz");
         assert_eq!(
-            tool_calls[0].function.as_ref().unwrap().name.as_ref().unwrap(),
+            tool_calls[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_ref()
+                .unwrap(),
             "get_weather"
         );
     }

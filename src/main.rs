@@ -5,7 +5,7 @@ mod handler;
 mod openai;
 mod transform;
 
-use axum::{routing::get, routing::post, Router};
+use axum::{Router, routing::get, routing::post};
 use handler::AppState;
 use std::sync::Arc;
 
@@ -14,7 +14,8 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let config = Arc::new(config::load_config());
-    let base_url = config::base_url();
+    let base_url = config::base_url(&config);
+    let port = config.port;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -32,11 +33,12 @@ async fn main() {
         .route("/health", get(handler::health_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .expect("Failed to bind to port 3000");
+        .unwrap_or_else(|e| panic!("Failed to bind to {}: {}", addr, e));
 
-    tracing::info!("Gateway listening on 0.0.0.0:3000");
+    tracing::info!("Gateway listening on {}", addr);
 
     axum::serve(listener, app).await.expect("Server error");
 }

@@ -86,10 +86,7 @@ fn convert_message(role: String, content: AnthropicContent, messages: &mut Vec<O
 
 /// Convert assistant message content blocks.
 /// Separates text/image blocks from tool_use blocks.
-fn convert_assistant_blocks(
-    blocks: Vec<AnthropicContentBlock>,
-    messages: &mut Vec<OpenAIMessage>,
-) {
+fn convert_assistant_blocks(blocks: Vec<AnthropicContentBlock>, messages: &mut Vec<OpenAIMessage>) {
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<OpenAIToolCallRequest> = Vec::new();
 
@@ -194,10 +191,8 @@ fn convert_content_blocks(blocks: Vec<AnthropicContentBlock>) -> OpenAIContent {
         }
     }
     // Multi-block → convert each
-    let converted: Vec<OpenAIContentBlock> = blocks
-        .into_iter()
-        .map(convert_content_block)
-        .collect();
+    let converted: Vec<OpenAIContentBlock> =
+        blocks.into_iter().map(convert_content_block).collect();
     OpenAIContent::MultiContent(converted)
 }
 
@@ -421,13 +416,11 @@ mod tests {
             model: "claude-3".into(),
             messages: vec![AnthropicMessage {
                 role: "user".into(),
-                content: AnthropicContent::TextBlocks(vec![
-                    AnthropicContentBlock::ToolResult {
-                        tool_use_id: "toolu_01".into(),
-                        content: Some(ToolResultContent::Text("72°F and sunny".into())),
-                        is_error: None,
-                    },
-                ]),
+                content: AnthropicContent::TextBlocks(vec![AnthropicContentBlock::ToolResult {
+                    tool_use_id: "toolu_01".into(),
+                    content: Some(ToolResultContent::Text("72°F and sunny".into())),
+                    is_error: None,
+                }]),
             }],
             system: None,
             max_tokens: 1024,
@@ -487,9 +480,15 @@ mod tests {
         // 2 tool messages + 1 user message
         assert_eq!(result.messages.len(), 3);
         assert_eq!(result.messages[0].role, "tool");
-        assert_eq!(result.messages[0].tool_call_id.as_ref().unwrap(), "toolu_01");
+        assert_eq!(
+            result.messages[0].tool_call_id.as_ref().unwrap(),
+            "toolu_01"
+        );
         assert_eq!(result.messages[1].role, "tool");
-        assert_eq!(result.messages[1].tool_call_id.as_ref().unwrap(), "toolu_02");
+        assert_eq!(
+            result.messages[1].tool_call_id.as_ref().unwrap(),
+            "toolu_02"
+        );
         assert_eq!(result.messages[2].role, "user");
         match &result.messages[2].content {
             OpenAIContent::Text(t) => assert_eq!(t, "Now continue."),
