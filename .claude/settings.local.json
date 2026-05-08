@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -d .worktrees)",
+      "Bash(ls -d worktrees)",
+      "Bash(grep -i \"worktree\" CLAUDE.md)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cat .gitignore)"
+    ]
+  }
+}

@@ -17,6 +17,10 @@ pub struct AnthropicRequest {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub top_k: Option<u32>,
+    #[serde(default)]
+    pub tools: Option<Vec<AnthropicTool>>,
+    #[serde(default)]
+    pub tool_choice: Option<AnthropicToolChoice>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,13 +38,46 @@ pub enum AnthropicContent {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct AnthropicContentBlock {
+#[serde(tag = "type")]
+pub enum AnthropicContentBlock {
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+    },
+    #[serde(rename = "image")]
+    Image {
+        source: ImageSource,
+    },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        #[serde(default)]
+        content: Option<ToolResultContent>,
+        #[serde(default)]
+        is_error: Option<bool>,
+    },
+}
+
+/// tool_result content can be a string or an array of content blocks.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ToolResultContentBlock>),
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ToolResultContentBlock {
     #[serde(rename = "type")]
     pub content_type: String,
     #[serde(default)]
     pub text: Option<String>,
-    #[serde(default)]
-    pub source: Option<ImageSource>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -56,7 +93,37 @@ pub struct ImageSource {
 #[serde(untagged)]
 pub enum AnthropicSystem {
     String(String),
-    ContentList(Vec<AnthropicContentBlock>),
+    ContentList(Vec<SystemContentBlock>),
+}
+
+/// System content block (simplified, only text type).
+#[derive(Debug, Deserialize)]
+pub struct SystemContentBlock {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+/// Tool definition in Anthropic format.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AnthropicTool {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub input_schema: serde_json::Value,
+}
+
+/// Tool choice in Anthropic format.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type")]
+pub enum AnthropicToolChoice {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "any")]
+    Any,
+    #[serde(rename = "tool")]
+    Tool { name: String },
 }
 
 /// Outgoing Anthropic response (non-streaming).
@@ -74,10 +141,16 @@ pub struct AnthropicResponse {
 }
 
 #[derive(Debug, Serialize, Clone)]
-pub struct AnthropicResponseContentBlock {
-    #[serde(rename = "type")]
-    pub content_type: String,
-    pub text: String,
+#[serde(tag = "type")]
+pub enum AnthropicResponseContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -133,10 +206,12 @@ pub struct AnthropicStreamMessage {
 }
 
 #[derive(Debug, Serialize, Clone)]
-pub struct ContentDelta {
-    #[serde(rename = "type")]
-    pub delta_type: String,
-    pub text: String,
+#[serde(tag = "type")]
+pub enum ContentDelta {
+    #[serde(rename = "text_delta")]
+    TextDelta { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJsonDelta { partial_json: String },
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -192,5 +267,121 @@ mod tests {
             AnthropicSystem::String(s) => assert_eq!(s, "You are helpful."),
             _ => panic!("expected string system"),
         }
+    }
+
+    #[test]
+    fn test_deserialize_request_with_tools() {
+        let json = r#"{
+            "model": "claude-3",
+            "messages": [{"role": "user", "content": "What is the weather?"}],
+            "max_tokens": 1024,
+            "tools": [
+                {
+                    "name": "get_weather",
+                    "description": "Get the current weather",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"}
+                        },
+                        "required": ["location"]
+                    }
+                }
+            ],
+            "tool_choice": {"type": "auto"}
+        }"#;
+        let req: AnthropicRequest = serde_json::from_str(json).unwrap();
+        let tools = req.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "get_weather");
+        match req.tool_choice.unwrap() {
+            AnthropicToolChoice::Auto => {}
+            _ => panic!("expected Auto"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_tool_use_content_block() {
+        let json = r#"[
+            {"type": "text", "text": "I'll check the weather."},
+            {"type": "tool_use", "id": "toolu_01", "name": "get_weather", "input": {"location": "NYC"}}
+        ]"#;
+        let blocks: Vec<AnthropicContentBlock> = serde_json::from_str(json).unwrap();
+        assert_eq!(blocks.len(), 2);
+        match &blocks[1] {
+            AnthropicContentBlock::ToolUse { id, name, input } => {
+                assert_eq!(id, "toolu_01");
+                assert_eq!(name, "get_weather");
+                assert_eq!(input["location"], "NYC");
+            }
+            _ => panic!("expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_tool_result_content_block() {
+        let json = r#"[
+            {"type": "tool_result", "tool_use_id": "toolu_01", "content": "72°F and sunny"}
+        ]"#;
+        let blocks: Vec<AnthropicContentBlock> = serde_json::from_str(json).unwrap();
+        match &blocks[0] {
+            AnthropicContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "toolu_01");
+                match content.as_ref().unwrap() {
+                    ToolResultContent::Text(t) => assert_eq!(t, "72°F and sunny"),
+                    _ => panic!("expected text content"),
+                }
+            }
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_tool_choice_variants() {
+        let auto: AnthropicToolChoice = serde_json::from_str(r#"{"type": "auto"}"#).unwrap();
+        assert!(matches!(auto, AnthropicToolChoice::Auto));
+
+        let any: AnthropicToolChoice = serde_json::from_str(r#"{"type": "any"}"#).unwrap();
+        assert!(matches!(any, AnthropicToolChoice::Any));
+
+        let tool: AnthropicToolChoice =
+            serde_json::from_str(r#"{"type": "tool", "name": "get_weather"}"#).unwrap();
+        match tool {
+            AnthropicToolChoice::Tool { name } => assert_eq!(name, "get_weather"),
+            _ => panic!("expected Tool"),
+        }
+    }
+
+    #[test]
+    fn test_serialize_response_with_tool_use() {
+        let resp = AnthropicResponse {
+            id: "msg_123".into(),
+            response_type: "message".into(),
+            role: "assistant".into(),
+            content: vec![
+                AnthropicResponseContentBlock::Text {
+                    text: "Let me check.".into(),
+                },
+                AnthropicResponseContentBlock::ToolUse {
+                    id: "toolu_01".into(),
+                    name: "get_weather".into(),
+                    input: serde_json::json!({"location": "NYC"}),
+                },
+            ],
+            model: "claude-3".into(),
+            stop_reason: Some("tool_use".into()),
+            stop_sequence: None,
+            usage: AnthropicUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"tool_use\""));
+        assert!(json.contains("\"get_weather\""));
     }
 }
