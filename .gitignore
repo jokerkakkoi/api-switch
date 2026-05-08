@@ -1,3 +1,4 @@
 /target
 .worktrees/
 config.yaml
+*.exe

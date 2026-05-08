@@ -10,7 +10,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::anthropic::AnthropicRequest;
-use crate::config::{AppConfig, lookup_token};
+use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::openai::OpenAISSEChunk;
 use crate::transform::request::convert_request;
@@ -45,24 +45,16 @@ pub async fn messages_handler(
     headers: HeaderMap,
     body: String,
 ) -> Result<Response, AppError> {
-    // 1. Extract Bearer token
-    let token = extract_bearer_token(&headers)
-        .ok_or_else(|| AppError::AuthenticationError("Missing Authorization header".into()))?;
-
-    // 2. Lookup credentials
-    let creds = lookup_token(&state.config, token)
-        .ok_or_else(|| AppError::AuthenticationError("Invalid bearer token".into()))?;
-
-    // 3. Parse Anthropic request
+    // 1. Parse Anthropic request
     let anthropic_req: AnthropicRequest = serde_json::from_str(&body)
         .map_err(|e| AppError::InvalidRequestError(format!("Invalid request body: {}", e)))?;
 
     let is_stream = anthropic_req.stream;
 
-    // 4. Convert request
+    // 2. Convert request
     let openai_req = convert_request(anthropic_req);
 
-    // 5. Build forwarded headers: keep all except Authorization, add App-Key + App-Sign
+    // 3. Build forwarded headers: skip hop-by-hop, add App-Key + App-Sign from config
     let mut fwd_headers = HeaderMap::new();
     for (key, value) in headers.iter() {
         if !SKIP_HEADERS.contains(&key.as_str()) {
@@ -71,12 +63,12 @@ pub async fn messages_handler(
     }
     fwd_headers.insert(
         HeaderName::from_static("app-key"),
-        HeaderValue::from_str(&creds.app_key)
+        HeaderValue::from_str(&state.config.app_key)
             .map_err(|_| AppError::ApiError("Invalid app_key value".into()))?,
     );
     fwd_headers.insert(
         HeaderName::from_static("app-sign"),
-        HeaderValue::from_str(&creds.app_sign)
+        HeaderValue::from_str(&state.config.app_sign)
             .map_err(|_| AppError::ApiError("Invalid app_sign value".into()))?,
     );
 
@@ -96,15 +88,6 @@ pub async fn messages_handler(
         handle_stream_response(request).await
     } else {
         handle_non_stream_response(request).await
-    }
-}
-
-fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let auth = headers.get("authorization")?.to_str().ok()?;
-    if let Some(token) = auth.strip_prefix("Bearer ") {
-        Some(token)
-    } else {
-        auth.strip_prefix("bearer ")
     }
 }
 
