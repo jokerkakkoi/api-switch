@@ -1,0 +1,4 @@
+app_key: "1******1"
+app_sign: "f*********8"
+openai_base_url: http://****:***/**/qwen35-397b/
+port: 3000

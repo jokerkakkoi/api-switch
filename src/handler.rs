@@ -78,7 +78,7 @@ pub async fn messages_handler(
         state.base_url.trim_end_matches('/'),
         OPENAI_CHAT_PATH
     );
-    tracing::info!("开始请求{}", &backend_url);
+    tracing::info!("开始{}请求{}", is_stream, &backend_url);
     let request = state
         .client
         .post(&backend_url)

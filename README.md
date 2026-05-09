@@ -25,19 +25,18 @@
 
 ### 配置文件
 
-创建 `config.yaml`：
+创建 `config.yaml` **(重要，必须和exe同文件夹下)**：
 
 ```yaml
-tokens:
-  sk-ant-your-token:
-    app_key: "sk-your-openai-api-key"
-    app_sign: "your-app-sign-value"
+app_key: "1******1"
+app_sign: "f*********8"
+openai_base_url: http://******:***/******/ # url不要带/v1/chat/completions
+port: 3000
 ```
 
 ### 运行
 
 ```bash
-export BASE_URL="https://your-backend.com"   # 默认: https://api.openai.com
 export CONFIG_PATH="./config.yaml"            # 默认: ./config.yaml
 cargo run
 ```
