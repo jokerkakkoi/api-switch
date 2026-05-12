@@ -41,7 +41,7 @@ export CONFIG_PATH="./config.yaml"            # 默认: ./config.yaml
 cargo run
 ```
 
-服务监听 `http://0.0.0.0:3000`。
+服务监听 `http://[IP_ADDRESS]`。
 
 ### 测试请求
 
@@ -82,7 +82,7 @@ curl http://localhost:3000/health
 | 方法 | 路径 | 说明 |
 |--------|------|-------------|
 | `POST` | `/v1/messages` | Anthropic → OpenAI 协议转换 |
-| `GET`  | `/health` | 健康检查（返回 `ok`） |
+| `GET`  | `/health` | 健康检查（主要为了测试网络） |
 
 ## 工作原理
 
@@ -162,24 +162,18 @@ POST /v1/messages
 ### `config.yaml`
 
 ```yaml
-tokens:
-  <anthropic-bearer-token>:
-    app_key: "<openai-api-key>"
-    app_sign: "<app-signature>"
+app_key: "<app_key>"
+app_sign: "<app_sign>"
+# url不要带/v1/chat/completions
+openai_base_url: http://[IP_ADDRESS]
+port: 3000
 ```
-
-### 环境变量
-
-| 变量 | 默认值 | 说明 |
-|----------|---------|-------------|
-| `CONFIG_PATH` | `./config.yaml` | 配置文件的路径 |
-| `BASE_URL` | `https://api.openai.com` | OpenAI 兼容后端的地址 |
 
 ## 开发
 
 ```bash
 # 构建
-cargo build
+cargo build -r
 
 # 运行全部测试
 cargo test
