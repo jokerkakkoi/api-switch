@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Build the project
-cargo build
+cargo build -r
 
 # Run all tests (tests are inline in src/ modules)
 cargo test
