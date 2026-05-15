@@ -16,8 +16,6 @@ async fn main() {
     let config = Arc::new(config::load_config());
     let base_url = config::base_url(&config);
     let port = config.port;
-    tracing::debug!("app_key: {}", config.app_key);
-    tracing::debug!("app_sign: {}", config.app_sign);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()

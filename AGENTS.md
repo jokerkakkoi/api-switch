@@ -40,7 +40,7 @@ port: 3000                                 # default, configurable
 
 Anthropic → OpenAI protocol conversion gateway (axum HTTP server).
 
-```
+```text
 src/main.rs           → Entry, route registration, port from config
 src/config.rs         → Flat AppConfig (app_key, app_sign, openai_base_url, port)
 src/error.rs          → AppError enum, Anthropic-format error responses
