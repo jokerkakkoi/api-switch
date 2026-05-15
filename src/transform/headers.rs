@@ -14,11 +14,7 @@ const SKIP_HEADERS: &[&str] = &[
 
 /// Build forwarded headers from incoming headers, skipping hop-by-hop headers
 /// and adding `app-key` and `app-sign` from config.
-pub fn build_forwarded_headers(
-    incoming: &HeaderMap,
-    app_key: &str,
-    app_sign: &str,
-) -> HeaderMap {
+pub fn build_forwarded_headers(incoming: &HeaderMap, app_key: &str, app_sign: &str) -> HeaderMap {
     let mut fwd = HeaderMap::new();
     for (key, value) in incoming.iter() {
         if !SKIP_HEADERS.contains(&key.as_str()) {
@@ -33,7 +29,6 @@ pub fn build_forwarded_headers(
         HeaderName::from_static("app-sign"),
         HeaderValue::from_str(app_sign).expect("invalid app_sign"),
     );
-    
     fwd
 }
 
@@ -79,10 +74,7 @@ mod tests {
     #[test]
     fn test_preserves_non_skip_headers() {
         let mut incoming = HeaderMap::new();
-        incoming.insert(
-            "anthropic-version",
-            HeaderValue::from_static("2023-06-01"),
-        );
+        incoming.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         incoming.insert("x-custom", HeaderValue::from_static("custom-value"));
 
         let result = build_forwarded_headers(&incoming, "key", "sign");
@@ -91,7 +83,10 @@ mod tests {
             result.get("anthropic-version").unwrap().to_str().unwrap(),
             "2023-06-01"
         );
-        assert_eq!(result.get("x-custom").unwrap().to_str().unwrap(), "custom-value");
+        assert_eq!(
+            result.get("x-custom").unwrap().to_str().unwrap(),
+            "custom-value"
+        );
     }
 
     #[test]

@@ -43,7 +43,8 @@ pub async fn messages_handler(
     let openai_req = convert_request(anthropic_req);
 
     // 3. Build forwarded headers: skip hop-by-hop, add App-Key + App-Sign from config
-    let fwd_headers = build_forwarded_headers(&headers, &state.config.app_key, &state.config.app_sign);
+    let fwd_headers =
+        build_forwarded_headers(&headers, &state.config.app_key, &state.config.app_sign);
 
     // 6. Send request to backend
     let backend_url = format!(
@@ -51,16 +52,20 @@ pub async fn messages_handler(
         state.base_url.trim_end_matches('/'),
         OPENAI_CHAT_PATH
     );
-    tracing::info!("开始{}请求{}", is_stream, &backend_url);
+    tracing::info!("Forwarding Anthropic request {}", &backend_url);
     let request = state
         .client
         .post(&backend_url)
         .headers(fwd_headers)
         .json(&openai_req);
     if is_stream {
-        handle_stream_response(request).await
+        let resp = handle_stream_response(request).await;
+        tracing::info!("Anthropic request completed (streaming)");
+        resp
     } else {
-        handle_non_stream_response(request).await
+        let resp = handle_non_stream_response(request).await;
+        tracing::info!("Anthropic request completed (non-streaming)");
+        resp
     }
 }
 
@@ -154,7 +159,8 @@ pub async fn chat_completions_handler(
     body: String,
 ) -> Result<Response, AppError> {
     // 1. Build forwarded headers: skip hop-by-hop, add App-Key + App-Sign from config
-    let fwd_headers = build_forwarded_headers(&headers, &state.config.app_key, &state.config.app_sign);
+    let fwd_headers =
+        build_forwarded_headers(&headers, &state.config.app_key, &state.config.app_sign);
 
     // 2. Forward to backend
     let backend_url = format!(
@@ -162,7 +168,7 @@ pub async fn chat_completions_handler(
         state.base_url.trim_end_matches('/'),
         OPENAI_CHAT_PATH
     );
-    tracing::info!("Forwarding chat/completions request to {}", &backend_url);
+    tracing::info!("Forwarding OpenAI request {}", &backend_url);
 
     let response = state
         .client
@@ -191,11 +197,30 @@ pub async fn chat_completions_handler(
         .unwrap_or(false);
 
     if is_stream {
-        // Stream the response body directly to the client
+        // Stream the response body directly to the client, logging raw SSE content
         let byte_stream = response.bytes_stream();
-        let body = axum::body::Body::from_stream(byte_stream);
+        let (tx, rx) = mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+
+        tokio::spawn(async move {
+            let mut stream = byte_stream;
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        let _ = tx.send(Ok(bytes)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("[/v1/chat/completions SSE] stream error: {}", e);
+                        return;
+                    }
+                }
+            }
+        });
+
+        let body = axum::body::Body::from_stream(ReceiverStream::new(rx));
         let mut resp = Response::builder().status(status).body(body).unwrap();
         *resp.headers_mut() = resp_headers;
+        tracing::info!("OpenAI request completed (streaming)");
         Ok(resp)
     } else {
         let body_bytes = response.bytes().await.unwrap_or_default();
@@ -204,6 +229,7 @@ pub async fn chat_completions_handler(
             .body(axum::body::Body::from(body_bytes))
             .unwrap();
         *resp.headers_mut() = resp_headers;
+        tracing::info!("OpenAI request completed (non-streaming)");
         Ok(resp)
     }
 }
@@ -242,9 +268,15 @@ mod tests {
             "/v1/chat/completions",
             post(|headers: HeaderMap, _body: String| async move {
                 // Verify that app-key and app-sign headers are injected
-                assert_eq!(headers.get("app-key").unwrap().to_str().unwrap(), "test-key");
-                assert_eq!(headers.get("app-sign").unwrap().to_str().unwrap(), "test-sign");
-                
+                assert_eq!(
+                    headers.get("app-key").unwrap().to_str().unwrap(),
+                    "test-key"
+                );
+                assert_eq!(
+                    headers.get("app-sign").unwrap().to_str().unwrap(),
+                    "test-sign"
+                );
+
                 // We return a mock function calling response according to OpenAI docs
                 let resp = json!({
                   "id": "chatcmpl-123",
@@ -286,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_completions_function_calling_proxy() {
         let backend_url = start_mock_backend().await;
-        
+
         let config = Arc::new(AppConfig {
             app_key: "test-key".into(),
             app_sign: "test-sign".into(),
@@ -342,7 +374,8 @@ mod tests {
             ]
         });
 
-        let res = client.post(format!("http://{}/v1/chat/completions", proxy_addr))
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
             .json(&req_body)
             .send()
             .await
@@ -350,8 +383,11 @@ mod tests {
 
         assert_eq!(res.status(), 200);
         let res_json: serde_json::Value = res.json().await.unwrap();
-        
-        assert_eq!(res_json["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "get_weather");
+
+        assert_eq!(
+            res_json["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
         assert_eq!(res_json["choices"][0]["finish_reason"], "tool_calls");
     }
 }
