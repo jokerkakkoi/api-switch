@@ -18,6 +18,7 @@ async fn main() {
     let port = config.port;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
+        .no_proxy()
         .build()
         .expect("Failed to create HTTP client");
 

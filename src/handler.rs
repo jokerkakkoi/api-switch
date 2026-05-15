@@ -61,6 +61,7 @@ pub async fn messages_handler(
     if is_stream {
         let resp = handle_stream_response(request).await;
         tracing::info!("Anthropic request completed (streaming)");
+        tracing::debug!("Response: {:#?}", resp);
         resp
     } else {
         let resp = handle_non_stream_response(request).await;
@@ -207,6 +208,7 @@ pub async fn chat_completions_handler(
                 match result {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes);
+                        tracing::debug!("[/v1/chat/completions SSE] {}", text);
                         let _ = tx.send(Ok(bytes)).await;
                     }
                     Err(e) => {
