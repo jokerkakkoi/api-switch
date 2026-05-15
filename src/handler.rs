@@ -2,9 +2,11 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response, Sse};
+use axum::response::sse::KeepAlive;
 use reqwest::Client;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -15,7 +17,7 @@ use crate::error::AppError;
 use crate::openai::OpenAISSEChunk;
 use crate::transform::request::convert_request;
 use crate::transform::response::{convert_response, map_openai_error};
-use crate::transform::stream::{StreamState, convert_stream_chunk, format_sse};
+use crate::transform::stream::{StreamState, convert_stream_chunk};
 
 const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 
@@ -102,6 +104,7 @@ async fn handle_non_stream_response(
             .json()
             .await
             .map_err(|e| AppError::ApiError(format!("Failed to parse backend response: {}", e)))?;
+        tracing::info!("OpenAI response: {:?}", openai_resp);
         let anthropic_resp = convert_response(openai_resp);
         Ok(Json(anthropic_resp).into_response())
     } else {
@@ -138,27 +141,43 @@ async fn handle_stream_response(request: reqwest::RequestBuilder) -> Result<Resp
 
                     // Process complete SSE messages (separated by \n\n)
                     while let Some(pos) = buffer.find("\n\n") {
-                        let line = buffer[..pos].to_string();
+                        let message = buffer[..pos].to_string();
                         buffer = buffer[pos + 2..].to_string();
 
-                        // Parse "data: {json}" line
-                        if let Some(data_str) = line
-                            .strip_prefix("data: ")
-                            .or_else(|| line.strip_prefix("data:"))
-                        {
-                            let data_str = data_str.trim();
-                            if data_str == "[DONE]" {
-                                continue;
-                            }
-                            if let Ok(chunk) = serde_json::from_str::<OpenAISSEChunk>(data_str) {
-                                let events = convert_stream_chunk(&chunk, &mut state);
-                                for event in events {
-                                    let sse_event = axum::response::sse::Event::default()
-                                        .data(format_sse(&event));
-                                    if tx.send(Ok(sse_event)).await.is_err() {
-                                        return; // client disconnected
+                        // Find the data: line within the SSE message
+                        for line in message.lines() {
+                            let line = line.trim();
+                            if let Some(data_str) = line
+                                .strip_prefix("data: ")
+                                .or_else(|| line.strip_prefix("data:"))
+                            {
+                                let data_str = data_str.trim();
+                                if data_str == "[DONE]" {
+                                    continue;
+                                }
+                                if let Ok(chunk) = serde_json::from_str::<OpenAISSEChunk>(data_str) {
+                                    tracing::info!("OpenAI SSE chunk: {:?}", chunk);
+                                    let events = convert_stream_chunk(&chunk, &mut state);
+                                    for event in events {
+                                        let event_type = match &event {
+                                            crate::anthropic::AnthropicSSEEvent::MessageStart { .. } => "message_start",
+                                            crate::anthropic::AnthropicSSEEvent::ContentBlockStart { .. } => "content_block_start",
+                                            crate::anthropic::AnthropicSSEEvent::ContentBlockDelta { .. } => "content_block_delta",
+                                            crate::anthropic::AnthropicSSEEvent::ContentBlockStop { .. } => "content_block_stop",
+                                            crate::anthropic::AnthropicSSEEvent::MessageDelta { .. } => "message_delta",
+                                            crate::anthropic::AnthropicSSEEvent::MessageStop => "message_stop",
+                                            crate::anthropic::AnthropicSSEEvent::Ping => "ping",
+                                        };
+                                        let data = serde_json::to_string(&event).unwrap();
+                                        let sse_event = axum::response::sse::Event::default()
+                                            .event(event_type)
+                                            .data(data);
+                                        if tx.send(Ok(sse_event)).await.is_err() {
+                                            return; // client disconnected
+                                        }
                                     }
                                 }
+                                break; // Only process first data: line per message
                             }
                         }
                     }
@@ -171,7 +190,13 @@ async fn handle_stream_response(request: reqwest::RequestBuilder) -> Result<Resp
     });
 
     let stream = ReceiverStream::new(rx);
-    Ok(Sse::new(stream).into_response())
+    Ok(Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response())
 }
 
 /// POST /v1/chat/completions — transparent OpenAI proxy (no protocol conversion)
@@ -197,6 +222,18 @@ pub async fn chat_completions_handler(
         HeaderValue::from_str(&state.config.app_sign)
             .map_err(|_| AppError::ApiError("Invalid app_sign value".into()))?,
     );
+    fwd_headers.insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("application/json"),
+    );
+
+    tracing::info!(
+        "Forwarded headers: {:?}",
+        fwd_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.to_str().unwrap_or("<binary>")))
+            .collect::<Vec<_>>()
+    );
 
     // 2. Forward to backend
     let backend_url = format!(
@@ -214,8 +251,11 @@ pub async fn chat_completions_handler(
         .send()
         .await?;
 
+    let backend_status = response.status();
+    tracing::info!("Backend response status: {}", backend_status);
+
     // 3. Pass through the response status and headers
-    let status = axum::http::StatusCode::from_u16(response.status().as_u16())
+    let status = axum::http::StatusCode::from_u16(backend_status.as_u16())
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
     let mut resp_headers = HeaderMap::new();
@@ -233,6 +273,7 @@ pub async fn chat_completions_handler(
         .unwrap_or(false);
 
     if is_stream {
+        tracing::info!("Backend response is a streaming response");
         // Stream the response body directly to the client
         let byte_stream = response.bytes_stream();
         let body = axum::body::Body::from_stream(byte_stream);
@@ -241,6 +282,7 @@ pub async fn chat_completions_handler(
         Ok(resp)
     } else {
         let body_bytes = response.bytes().await.unwrap_or_default();
+        tracing::info!("Backend response body: {}", String::from_utf8_lossy(&body_bytes));
         let mut resp = Response::builder()
             .status(status)
             .body(axum::body::Body::from(body_bytes))
