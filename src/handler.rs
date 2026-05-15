@@ -174,6 +174,82 @@ async fn handle_stream_response(request: reqwest::RequestBuilder) -> Result<Resp
     Ok(Sse::new(stream).into_response())
 }
 
+/// POST /v1/chat/completions — transparent OpenAI proxy (no protocol conversion)
+pub async fn chat_completions_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, AppError> {
+    // 1. Build forwarded headers: skip hop-by-hop, add App-Key + App-Sign from config
+    let mut fwd_headers = HeaderMap::new();
+    for (key, value) in headers.iter() {
+        if !SKIP_HEADERS.contains(&key.as_str()) {
+            fwd_headers.insert(key, value.clone());
+        }
+    }
+    fwd_headers.insert(
+        HeaderName::from_static("app-key"),
+        HeaderValue::from_str(&state.config.app_key)
+            .map_err(|_| AppError::ApiError("Invalid app_key value".into()))?,
+    );
+    fwd_headers.insert(
+        HeaderName::from_static("app-sign"),
+        HeaderValue::from_str(&state.config.app_sign)
+            .map_err(|_| AppError::ApiError("Invalid app_sign value".into()))?,
+    );
+
+    // 2. Forward to backend
+    let backend_url = format!(
+        "{}{}",
+        state.base_url.trim_end_matches('/'),
+        OPENAI_CHAT_PATH
+    );
+    tracing::info!("Forwarding chat/completions request to {}", &backend_url);
+
+    let response = state
+        .client
+        .post(&backend_url)
+        .headers(fwd_headers)
+        .body(body)
+        .send()
+        .await?;
+
+    // 3. Pass through the response status and headers
+    let status = axum::http::StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+    let mut resp_headers = HeaderMap::new();
+    for (key, value) in response.headers().iter() {
+        if let Ok(name) = HeaderName::from_bytes(key.as_str().as_bytes()) {
+            resp_headers.insert(name, value.clone());
+        }
+    }
+
+    // 4. Check if this is a streaming response and pass through accordingly
+    let is_stream = resp_headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+
+    if is_stream {
+        // Stream the response body directly to the client
+        let byte_stream = response.bytes_stream();
+        let body = axum::body::Body::from_stream(byte_stream);
+        let mut resp = Response::builder().status(status).body(body).unwrap();
+        *resp.headers_mut() = resp_headers;
+        Ok(resp)
+    } else {
+        let body_bytes = response.bytes().await.unwrap_or_default();
+        let mut resp = Response::builder()
+            .status(status)
+            .body(axum::body::Body::from(body_bytes))
+            .unwrap();
+        *resp.headers_mut() = resp_headers;
+        Ok(resp)
+    }
+}
+
 /// GET /health — proxy health check to the configured backend
 pub async fn health_handler(State(state): State<AppState>) -> Result<Response, AppError> {
     let backend_url = format!("{}/health", state.base_url.trim_end_matches('/'));
@@ -194,4 +270,130 @@ pub async fn health_handler(State(state): State<AppState>) -> Result<Response, A
         body,
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, routing::post};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    async fn start_mock_backend() -> String {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|headers: HeaderMap, _body: String| async move {
+                // Verify that app-key and app-sign headers are injected
+                assert_eq!(headers.get("app-key").unwrap().to_str().unwrap(), "test-key");
+                assert_eq!(headers.get("app-sign").unwrap().to_str().unwrap(), "test-sign");
+                
+                // We return a mock function calling response according to OpenAI docs
+                let resp = json!({
+                  "id": "chatcmpl-123",
+                  "object": "chat.completion",
+                  "created": 1731610419,
+                  "model": "gpt-4o",
+                  "choices": [
+                    {
+                      "index": 0,
+                      "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_12345xyz",
+                            "type": "function",
+                            "function": {
+                              "name": "get_weather",
+                              "arguments": "{\"location\":\"Boston, MA\"}"
+                            }
+                          }
+                        ]
+                      },
+                      "finish_reason": "tool_calls"
+                    }
+                  ]
+                });
+                axum::Json(resp)
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_function_calling_proxy() {
+        let backend_url = start_mock_backend().await;
+        
+        let config = Arc::new(AppConfig {
+            app_key: "test-key".into(),
+            app_sign: "test-sign".into(),
+            openai_base_url: Some(backend_url.clone()),
+            port: 0,
+        });
+
+        let state = AppState {
+            config,
+            client: Client::new(),
+            base_url: backend_url,
+        };
+
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions_handler))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let req_body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the weather like in Boston?"
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get current temperature for a given location.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {
+                                    "type": "string",
+                                    "description": "City and country"
+                                }
+                            },
+                            "required": ["location"],
+                            "additionalProperties": false
+                        },
+                        "strict": true
+                    }
+                }
+            ]
+        });
+
+        let res = client.post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&req_body)
+            .send()
+            .await
+            .expect("Request failed");
+
+        assert_eq!(res.status(), 200);
+        let res_json: serde_json::Value = res.json().await.unwrap();
+        
+        assert_eq!(res_json["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "get_weather");
+        assert_eq!(res_json["choices"][0]["finish_reason"], "tool_calls");
+    }
 }

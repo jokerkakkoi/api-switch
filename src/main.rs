@@ -30,6 +30,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/v1/messages", post(handler::messages_handler))
+        .route("/v1/chat/completions", post(handler::chat_completions_handler))
         .route("/health", get(handler::health_handler))
         .with_state(state);
 
