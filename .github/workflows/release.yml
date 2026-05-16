@@ -3,7 +3,7 @@ name: Build and Release
 on:
   push:
     branches:
-      - master
+      - release/*
 
 permissions:
   contents: write
@@ -52,6 +52,12 @@ jobs:
           restore-keys: |
             ${{ matrix.target }}-cargo-
 
+      - name: Run tests
+        run: cargo test
+
+      - name: Check formatting
+        run: cargo fmt --check
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -61,7 +67,7 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/
           cp config.yaml.example dist/
-          cp release-readme.md dist/README.md
+          cp README.md dist/README.md
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -72,6 +78,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/heads/release/')
 
     steps:
       - name: Checkout code
@@ -116,30 +123,50 @@ jobs:
           zip -r ../../release/api-switch-v${{ steps.version.outputs.version }}-windows-amd64.zip *
           cd ../..
 
+      - name: Generate release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          NOTES=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+            -f tag_name="v${VERSION}" \
+            ${PREV_TAG:+-f previous_tag_name="$PREV_TAG"} \
+            --jq .body)
+
+          {
+            echo "$NOTES"
+            echo ""
+            echo "## 下载说明"
+            echo ""
+            echo "| 平台 | 架构 | 文件 |"
+            echo "|------|------|------|"
+            echo "| macOS | Intel (x86_64) | \`api-switch-v${VERSION}-macos-amd64.tar.gz\` |"
+            echo "| macOS | Apple Silicon (ARM64) | \`api-switch-v${VERSION}-macos-arm64.tar.gz\` |"
+            echo "| Linux | x86_64 | \`api-switch-v${VERSION}-linux-amd64.tar.gz\` |"
+            echo "| Windows | x86_64 | \`api-switch-v${VERSION}-windows-amd64.zip\` |"
+            echo ""
+            echo "### 使用方法"
+            echo ""
+            echo "1. 下载对应平台的压缩包并解压"
+            echo "2. 将 \`config.yaml.example\` 复制为 \`config.yaml\` 并修改配置"
+            echo "3. 运行 \`api-switch\`（Windows 下运行 \`api-switch.exe\`）"
+            echo ""
+            echo "详细说明请参考压缩包内的 \`README.md\`。"
+          } > release_body.md
+
+          echo "body<<RELEASE_BODY_EOF" >> "$GITHUB_OUTPUT"
+          cat release_body.md >> "$GITHUB_OUTPUT"
+          echo "RELEASE_BODY_EOF" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: Release v${{ steps.version.outputs.version }}
-          body: |
-            ## api-switch v${{ steps.version.outputs.version }}
-
-            ### 下载说明
-
-            | 平台 | 架构 | 文件 |
-            |------|------|------|
-            | macOS | Intel (x86_64) | `api-switch-v${{ steps.version.outputs.version }}-macos-amd64.tar.gz` |
-            | macOS | Apple Silicon (ARM64) | `api-switch-v${{ steps.version.outputs.version }}-macos-arm64.tar.gz` |
-            | Linux | x86_64 | `api-switch-v${{ steps.version.outputs.version }}-linux-amd64.tar.gz` |
-            | Windows | x86_64 | `api-switch-v${{ steps.version.outputs.version }}-windows-amd64.zip` |
-
-            ### 使用方法
-
-            1. 下载对应平台的压缩包并解压
-            2. 将 `config.yaml.example` 复制为 `config.yaml` 并修改配置
-            3. 运行 `api-switch`（Windows 下运行 `api-switch.exe`）
-
-            详细说明请参考压缩包内的 `README.md`。
+          body: ${{ steps.notes.outputs.body }}
           files: release/*
           draft: false
           prerelease: false
