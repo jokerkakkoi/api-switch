@@ -44,7 +44,7 @@ pub async fn messages_handler(
 
     // 3. Build forwarded headers: skip hop-by-hop, add App-Key + App-Sign from config
     let fwd_headers =
-        build_forwarded_headers(&headers, &state.config.app_key, &state.config.app_sign);
+        build_forwarded_headers(&headers, &state.config.app_key, &state.config.app_sign)?;
 
     // 6. Send request to backend
     let backend_url = format!(
@@ -161,7 +161,7 @@ pub async fn chat_completions_handler(
 ) -> Result<Response, AppError> {
     // 1. Build forwarded headers: skip hop-by-hop, add App-Key + App-Sign from config
     let fwd_headers =
-        build_forwarded_headers(&headers, &state.config.app_key, &state.config.app_sign);
+        build_forwarded_headers(&headers, &state.config.app_key, &state.config.app_sign)?;
 
     // 2. Forward to backend
     let backend_url = format!(
