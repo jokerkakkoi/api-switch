@@ -74,6 +74,12 @@ impl From<reqwest::Error> for AppError {
     }
 }
 
+impl From<axum::http::Error> for AppError {
+    fn from(err: axum::http::Error) -> Self {
+        AppError::ApiError(format!("Failed to build response: {}", err))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

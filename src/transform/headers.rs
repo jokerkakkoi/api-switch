@@ -27,7 +27,11 @@ fn parse_connection_tokens(connection_value: &str) -> HashSet<String> {
 /// Build forwarded headers from incoming headers, skipping hop-by-hop headers
 /// (both standard ones and those declared in the Connection header per RFC 7230 Section 6.1)
 /// and adding `app-key` and `app-sign` from config.
-pub fn build_forwarded_headers(incoming: &HeaderMap, app_key: &str, app_sign: &str) -> Result<HeaderMap, AppError> {
+pub fn build_forwarded_headers(
+    incoming: &HeaderMap,
+    app_key: &str,
+    app_sign: &str,
+) -> Result<HeaderMap, AppError> {
     let mut skip_set: HashSet<String> = SKIP_HEADERS.iter().map(|s| s.to_string()).collect();
 
     // Parse Connection header for dynamic hop-by-hop declarations
@@ -126,22 +130,37 @@ mod tests {
     #[test]
     fn test_filters_connection_declared_hop_by_hop_headers() {
         let mut incoming = HeaderMap::new();
-        incoming.insert("connection", HeaderValue::from_static("x-custom, x-another"));
+        incoming.insert(
+            "connection",
+            HeaderValue::from_static("x-custom, x-another"),
+        );
         incoming.insert("x-custom", HeaderValue::from_static("should-be-filtered"));
         incoming.insert("x-another", HeaderValue::from_static("also-filtered"));
         incoming.insert("x-not-declared", HeaderValue::from_static("should-pass"));
 
         let result = build_forwarded_headers(&incoming, "key", "sign").unwrap();
 
-        assert!(result.get("x-custom").is_none(), "x-custom should be filtered");
-        assert!(result.get("x-another").is_none(), "x-another should be filtered");
-        assert!(result.get("x-not-declared").is_some(), "x-not-declared should pass");
+        assert!(
+            result.get("x-custom").is_none(),
+            "x-custom should be filtered"
+        );
+        assert!(
+            result.get("x-another").is_none(),
+            "x-another should be filtered"
+        );
+        assert!(
+            result.get("x-not-declared").is_some(),
+            "x-not-declared should pass"
+        );
     }
 
     #[test]
     fn test_connection_case_insensitive_and_whitespace() {
         let mut incoming = HeaderMap::new();
-        incoming.insert("connection", HeaderValue::from_static("  X-Custom ,  KEEP-ALIVE  , te "));
+        incoming.insert(
+            "connection",
+            HeaderValue::from_static("  X-Custom ,  KEEP-ALIVE  , te "),
+        );
         incoming.insert("x-custom", HeaderValue::from_static("filtered"));
         incoming.insert("keep-alive", HeaderValue::from_static("filtered"));
         incoming.insert("te", HeaderValue::from_static("filtered"));
