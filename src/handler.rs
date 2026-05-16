@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderName};
 use axum::response::{IntoResponse, Response, Sse};
 use reqwest::Client;
 use std::convert::Infallible;
@@ -13,24 +13,12 @@ use crate::anthropic::AnthropicRequest;
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::openai::OpenAISSEChunk;
+use crate::transform::headers::build_forwarded_headers;
 use crate::transform::request::convert_request;
 use crate::transform::response::{convert_response, map_openai_error};
 use crate::transform::stream::{StreamState, convert_stream_chunk, format_sse};
 
 const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
-
-const SKIP_HEADERS: &[&str] = &[
-    "authorization",
-    "content-length", // ← 加这个，让 reqwest 自动计算
-    "content-type",   // ← 加这个，让 .json() 自己设
-    "host",           // ← 加这个，避免路由错误
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "te",
-    "trailers",
-    "upgrade",
-];
 
 #[derive(Clone)]
 pub struct AppState {
@@ -55,22 +43,8 @@ pub async fn messages_handler(
     let openai_req = convert_request(anthropic_req);
 
     // 3. Build forwarded headers: skip hop-by-hop, add App-Key + App-Sign from config
-    let mut fwd_headers = HeaderMap::new();
-    for (key, value) in headers.iter() {
-        if !SKIP_HEADERS.contains(&key.as_str()) {
-            fwd_headers.insert(key, value.clone());
-        }
-    }
-    fwd_headers.insert(
-        HeaderName::from_static("app-key"),
-        HeaderValue::from_str(&state.config.app_key)
-            .map_err(|_| AppError::ApiError("Invalid app_key value".into()))?,
-    );
-    fwd_headers.insert(
-        HeaderName::from_static("app-sign"),
-        HeaderValue::from_str(&state.config.app_sign)
-            .map_err(|_| AppError::ApiError("Invalid app_sign value".into()))?,
-    );
+    let fwd_headers =
+        build_forwarded_headers(&headers, &state.config.app_key, &state.config.app_sign)?;
 
     // 6. Send request to backend
     let backend_url = format!(
@@ -78,16 +52,21 @@ pub async fn messages_handler(
         state.base_url.trim_end_matches('/'),
         OPENAI_CHAT_PATH
     );
-    tracing::info!("开始{}请求{}", is_stream, &backend_url);
+    tracing::info!("Forwarding Anthropic request {}", &backend_url);
     let request = state
         .client
         .post(&backend_url)
         .headers(fwd_headers)
         .json(&openai_req);
     if is_stream {
-        handle_stream_response(request).await
+        let resp = handle_stream_response(request).await;
+        tracing::info!("Anthropic request completed (streaming)");
+        tracing::debug!("Response: {:#?}", resp);
+        resp
     } else {
-        handle_non_stream_response(request).await
+        let resp = handle_non_stream_response(request).await;
+        tracing::info!("Anthropic request completed (non-streaming)");
+        resp
     }
 }
 
@@ -174,6 +153,92 @@ async fn handle_stream_response(request: reqwest::RequestBuilder) -> Result<Resp
     Ok(Sse::new(stream).into_response())
 }
 
+/// POST /v1/chat/completions — transparent OpenAI proxy (no protocol conversion)
+pub async fn chat_completions_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, AppError> {
+    // 1. Build forwarded headers: skip hop-by-hop, add App-Key + App-Sign from config
+    let mut fwd_headers =
+        build_forwarded_headers(&headers, &state.config.app_key, &state.config.app_sign)?;
+    fwd_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+
+    // 2. Forward to backend
+    let backend_url = format!(
+        "{}{}",
+        state.base_url.trim_end_matches('/'),
+        OPENAI_CHAT_PATH
+    );
+    tracing::info!("Forwarding OpenAI request {}", &backend_url);
+
+    let response = state
+        .client
+        .post(&backend_url)
+        .headers(fwd_headers)
+        .body(body)
+        .send()
+        .await?;
+
+    // 3. Pass through the response status and headers
+    let status = axum::http::StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+    let mut resp_headers = HeaderMap::new();
+    for (key, value) in response.headers().iter() {
+        if let Ok(name) = HeaderName::from_bytes(key.as_str().as_bytes()) {
+            resp_headers.insert(name, value.clone());
+        }
+    }
+
+    // 4. Check if this is a streaming response and pass through accordingly
+    let is_stream = resp_headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+
+    if is_stream {
+        // Stream the response body directly to the client, logging raw SSE content
+        let byte_stream = response.bytes_stream();
+        let (tx, rx) = mpsc::channel::<Result<axum::body::Bytes, reqwest::Error>>(32);
+
+        tokio::spawn(async move {
+            let mut stream = byte_stream;
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        tracing::debug!("[/v1/chat/completions SSE] {}", text);
+                        let _ = tx.send(Ok(bytes)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("[/v1/chat/completions SSE] stream error: {}", e);
+                        return;
+                    }
+                }
+            }
+            tracing::info!("OpenAI request completed (streaming)");
+        });
+
+        let body = axum::body::Body::from_stream(ReceiverStream::new(rx));
+        let mut resp = Response::builder().status(status).body(body)?;
+        *resp.headers_mut() = resp_headers;
+        Ok(resp)
+    } else {
+        let body_bytes = response.bytes().await.unwrap_or_default();
+        let mut resp = Response::builder()
+            .status(status)
+            .body(axum::body::Body::from(body_bytes))?;
+        *resp.headers_mut() = resp_headers;
+        tracing::info!("OpenAI request completed (non-streaming)");
+        Ok(resp)
+    }
+}
+
 /// GET /health — proxy health check to the configured backend
 pub async fn health_handler(State(state): State<AppState>) -> Result<Response, AppError> {
     let backend_url = format!("{}/health", state.base_url.trim_end_matches('/'));
@@ -194,4 +259,314 @@ pub async fn health_handler(State(state): State<AppState>) -> Result<Response, A
         body,
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, routing::post};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    async fn start_mock_backend() -> String {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|headers: HeaderMap, _body: String| async move {
+                // Verify that app-key and app-sign headers are injected
+                assert_eq!(
+                    headers.get("app-key").unwrap().to_str().unwrap(),
+                    "test-key"
+                );
+                assert_eq!(
+                    headers.get("app-sign").unwrap().to_str().unwrap(),
+                    "test-sign"
+                );
+
+                // We return a mock function calling response according to OpenAI docs
+                let resp = json!({
+                  "id": "chatcmpl-123",
+                  "object": "chat.completion",
+                  "created": 1731610419,
+                  "model": "gpt-4o",
+                  "choices": [
+                    {
+                      "index": 0,
+                      "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [
+                          {
+                            "id": "call_12345xyz",
+                            "type": "function",
+                            "function": {
+                              "name": "get_weather",
+                              "arguments": "{\"location\":\"Boston, MA\"}"
+                            }
+                          }
+                        ]
+                      },
+                      "finish_reason": "tool_calls"
+                    }
+                  ]
+                });
+                axum::Json(resp)
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_function_calling_proxy() {
+        let backend_url = start_mock_backend().await;
+
+        let config = Arc::new(AppConfig {
+            app_key: "test-key".into(),
+            app_sign: "test-sign".into(),
+            openai_base_url: Some(backend_url.clone()),
+            port: 0,
+        });
+
+        let state = AppState {
+            config,
+            client: Client::new(),
+            base_url: backend_url,
+        };
+
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions_handler))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let req_body = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is the weather like in Boston?"
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get current temperature for a given location.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {
+                                    "type": "string",
+                                    "description": "City and country"
+                                }
+                            },
+                            "required": ["location"],
+                            "additionalProperties": false
+                        },
+                        "strict": true
+                    }
+                }
+            ]
+        });
+
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&req_body)
+            .send()
+            .await
+            .expect("Request failed");
+
+        assert_eq!(res.status(), 200);
+        let res_json: serde_json::Value = res.json().await.unwrap();
+
+        assert_eq!(
+            res_json["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(res_json["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    async fn start_mock_backend_for_sse() -> String {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|_headers: HeaderMap, _body: String| async move {
+                let stream = futures::stream::iter(vec![
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                        "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1731610419,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+                    )),
+                    Ok(axum::body::Bytes::from(
+                        "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1731610419,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n",
+                    )),
+                    Ok(axum::body::Bytes::from(
+                        "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1731610419,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    )),
+                    Ok(axum::body::Bytes::from("data: [DONE]\n\n")),
+                ]);
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(stream),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_returns_sse_events() {
+        let backend_url = start_mock_backend_for_sse().await;
+
+        let config = Arc::new(AppConfig {
+            app_key: "test-key".into(),
+            app_sign: "test-sign".into(),
+            openai_base_url: Some(backend_url.clone()),
+            port: 0,
+        });
+
+        let state = AppState {
+            config,
+            client: Client::new(),
+            base_url: backend_url,
+        };
+
+        let app = Router::new()
+            .route("/v1/messages", post(messages_handler))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let req_body = json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1024,
+            "stream": true
+        });
+
+        let res = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", "2023-06-01")
+            .json(&req_body)
+            .send()
+            .await
+            .expect("Request failed");
+
+        assert_eq!(res.status(), 200);
+        assert!(
+            res.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("text/event-stream")
+        );
+
+        let body = res.text().await.expect("Failed to read response body");
+        // Should contain Anthropic SSE events
+        assert!(body.contains("event: message_start"));
+        assert!(body.contains("event: content_block_start"));
+        assert!(body.contains("event: content_block_delta"));
+        assert!(body.contains("event: content_block_stop"));
+        assert!(body.contains("event: message_delta"));
+        assert!(body.contains("event: message_stop"));
+    }
+
+    async fn start_mock_backend_check_content_type_explicit() -> String {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|headers: HeaderMap, _body: String| async move {
+                let ct = headers.get("content-type");
+                assert!(
+                    ct.is_some(),
+                    "content-type header must be set on outgoing request to backend"
+                );
+                let ct_str = ct.unwrap().to_str().unwrap();
+                assert!(
+                    ct_str.contains("application/json"),
+                    "content-type should be application/json, got: {}",
+                    ct_str
+                );
+                let resp = json!({
+                    "id": "chatcmpl-123",
+                    "object": "chat.completion",
+                    "created": 1731610419,
+                    "model": "gpt-4o",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello"},
+                        "finish_reason": "stop"
+                    }]
+                });
+                axum::Json(resp)
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn test_chat_completions_sets_content_type_on_outgoing_request() {
+        let backend_url = start_mock_backend_check_content_type_explicit().await;
+
+        let config = Arc::new(AppConfig {
+            app_key: "test-key".into(),
+            app_sign: "test-sign".into(),
+            openai_base_url: Some(backend_url.clone()),
+            port: 0,
+        });
+
+        let state = AppState {
+            config,
+            client: Client::new(),
+            base_url: backend_url,
+        };
+
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions_handler))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let req_body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+
+        // Send with raw body() and explicit text/plain content-type — this should NOT
+        // strip the content-type; the handler must ensure application/json goes to backend
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .header("content-type", "text/plain")
+            .body(req_body)
+            .send()
+            .await
+            .expect("Request failed");
+
+        assert_eq!(res.status(), 200);
+    }
 }

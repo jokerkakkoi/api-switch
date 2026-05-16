@@ -16,9 +16,9 @@ async fn main() {
     let config = Arc::new(config::load_config());
     let base_url = config::base_url(&config);
     let port = config.port;
-
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
+        .no_proxy()
         .build()
         .expect("Failed to create HTTP client");
 
@@ -30,6 +30,10 @@ async fn main() {
 
     let app = Router::new()
         .route("/v1/messages", post(handler::messages_handler))
+        .route(
+            "/v1/chat/completions",
+            post(handler::chat_completions_handler),
+        )
         .route("/health", get(handler::health_handler))
         .with_state(state);
 
