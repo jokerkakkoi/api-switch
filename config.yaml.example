@@ -1,4 +1,10 @@
-app_key: "1******1"
-app_sign: "f*********8"
-openai_base_url: http://****:***/**/qwen35-397b/
+models:
+  - name: qwen35-397b
+    app_key: "**********"
+    app_sign: "************"
+    base_url: ******************
+  - name: glm-5
+    app_key: "**********"
+    app_sign: "************"
+    base_url: ******************
 port: 3000

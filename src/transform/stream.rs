@@ -552,6 +552,157 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_convert_stream_chunk_no_choices() {
+        let chunk = OpenAISSEChunk {
+            id: Some("chatcmpl-123".into()),
+            model: Some("gpt-4".into()),
+            choices: None,
+            usage: None,
+        };
+        let mut state = StreamState::new();
+        let events = convert_stream_chunk(&chunk, &mut state);
+
+        // Should still emit message_start on first chunk
+        assert!(state.started);
+        assert_eq!(state.model, "gpt-4");
+        let has_msg_start = events
+            .iter()
+            .any(|e| matches!(e, AnthropicSSEEvent::MessageStart { .. }));
+        assert!(has_msg_start);
+        // No content block start since there's no delta
+        assert!(!state.content_block_open);
+    }
+
+    #[test]
+    fn test_stream_tool_call_arguments_accumulation() {
+        let mut state = StreamState::new();
+        state.started = true;
+
+        // Start tool call
+        let chunk1 = make_chunk(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![OpenAIDeltaToolCall {
+                index: 0,
+                id: Some("call_abc".into()),
+                call_type: Some("function".into()),
+                function: Some(OpenAIDeltaFunction {
+                    name: Some("get_weather".into()),
+                    arguments: Some(String::new()),
+                }),
+            }]),
+        );
+        convert_stream_chunk(&chunk1, &mut state);
+
+        // First arguments delta
+        let chunk2 = make_chunk(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![OpenAIDeltaToolCall {
+                index: 0,
+                id: None,
+                call_type: None,
+                function: Some(OpenAIDeltaFunction {
+                    name: None,
+                    arguments: Some("{\"location\"".into()),
+                }),
+            }]),
+        );
+        convert_stream_chunk(&chunk2, &mut state);
+
+        // Second arguments delta
+        let chunk3 = make_chunk(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![OpenAIDeltaToolCall {
+                index: 0,
+                id: None,
+                call_type: None,
+                function: Some(OpenAIDeltaFunction {
+                    name: None,
+                    arguments: Some(":\"NYC\"}".into()),
+                }),
+            }]),
+        );
+        convert_stream_chunk(&chunk3, &mut state);
+
+        // Verify accumulated buffer
+        let tc_state = state.tool_calls.get(&0).unwrap();
+        assert_eq!(tc_state.arguments_buffer, "{\"location\":\"NYC\"}");
+    }
+
+    #[test]
+    fn test_format_sse_all_event_types() {
+        let events: Vec<AnthropicSSEEvent> = vec![
+            AnthropicSSEEvent::MessageStart {
+                message: AnthropicStreamMessage {
+                    id: "msg_test".into(),
+                    msg_type: "message".into(),
+                    role: "assistant".into(),
+                    content: vec![],
+                    model: "gpt-4".into(),
+                    stop_reason: None,
+                    stop_sequence: None,
+                    usage: AnthropicUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    },
+                },
+            },
+            AnthropicSSEEvent::ContentBlockStart {
+                index: 0,
+                content_block: AnthropicResponseContentBlock::Text {
+                    text: String::new(),
+                },
+            },
+            AnthropicSSEEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentDelta::TextDelta { text: "hi".into() },
+            },
+            AnthropicSSEEvent::ContentBlockStop { index: 0 },
+            AnthropicSSEEvent::MessageDelta {
+                delta: MessageDeltaData {
+                    stop_reason: "end_turn".into(),
+                    stop_sequence: None,
+                },
+                usage: OutputUsage { output_tokens: 5 },
+            },
+            AnthropicSSEEvent::MessageStop,
+            AnthropicSSEEvent::Ping,
+        ];
+
+        let expected_types = [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+            "ping",
+        ];
+
+        for (event, expected_type) in events.iter().zip(expected_types.iter()) {
+            let output = format_sse(event);
+            assert!(
+                output.starts_with(&format!("event: {}\n", expected_type)),
+                "Expected event type '{}', got: {}",
+                expected_type,
+                output.lines().next().unwrap_or("")
+            );
+            assert!(output.ends_with("\n\n"));
+        }
+    }
+
     // Helper
     fn make_chunk(
         role: Option<&str>,

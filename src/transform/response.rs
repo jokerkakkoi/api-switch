@@ -3,8 +3,11 @@ use crate::error::AppError;
 use crate::openai::{OpenAIErrorResponse, OpenAIResponse};
 
 /// Convert an OpenAI non-streaming response into an Anthropic response.
-pub fn convert_response(resp: OpenAIResponse) -> AnthropicResponse {
-    let choice = &resp.choices[0];
+pub fn convert_response(resp: OpenAIResponse) -> Result<AnthropicResponse, AppError> {
+    let choice = resp
+        .choices
+        .first()
+        .ok_or_else(|| AppError::ApiError("Backend returned empty choices".to_string()))?;
 
     let mut content: Vec<AnthropicResponseContentBlock> = Vec::new();
 
@@ -41,7 +44,7 @@ pub fn convert_response(resp: OpenAIResponse) -> AnthropicResponse {
 
     let stop_reason = choice.finish_reason.as_deref().map(map_stop_reason);
 
-    AnthropicResponse {
+    Ok(AnthropicResponse {
         id: resp.id,
         response_type: "message".to_string(),
         role: choice.message.role.clone(),
@@ -50,7 +53,7 @@ pub fn convert_response(resp: OpenAIResponse) -> AnthropicResponse {
         stop_reason,
         stop_sequence: None,
         usage,
-    }
+    })
 }
 
 /// Map OpenAI finish_reason to Anthropic stop_reason.
@@ -113,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_convert_response_content() {
-        let result = convert_response(make_response("Hello!"));
+        let result = convert_response(make_response("Hello!")).unwrap();
         assert_eq!(result.id, "chatcmpl-123");
         assert_eq!(result.role, "assistant");
         assert_eq!(result.content.len(), 1);
@@ -125,14 +128,14 @@ mod tests {
 
     #[test]
     fn test_convert_response_usage() {
-        let result = convert_response(make_response("Hi"));
+        let result = convert_response(make_response("Hi")).unwrap();
         assert_eq!(result.usage.input_tokens, 10);
         assert_eq!(result.usage.output_tokens, 5);
     }
 
     #[test]
     fn test_convert_response_stop_reason_end_turn() {
-        let result = convert_response(make_response("ok"));
+        let result = convert_response(make_response("ok")).unwrap();
         assert_eq!(result.stop_reason, Some("end_turn".into()));
     }
 
@@ -163,7 +166,7 @@ mod tests {
                 total_tokens: 30,
             }),
         };
-        let result = convert_response(resp);
+        let result = convert_response(resp).unwrap();
         assert_eq!(result.stop_reason, Some("tool_use".into()));
         assert_eq!(result.content.len(), 1);
         match &result.content[0] {
@@ -203,7 +206,7 @@ mod tests {
                 total_tokens: 23,
             }),
         };
-        let result = convert_response(resp);
+        let result = convert_response(resp).unwrap();
         // Should have both text and tool_use
         assert_eq!(result.content.len(), 2);
         match &result.content[0] {
@@ -258,6 +261,112 @@ mod tests {
         let err = map_openai_error(500, "Internal error");
         match err {
             AppError::ApiError(_) => {}
+            _ => panic!("expected ApiError"),
+        }
+    }
+
+    #[test]
+    fn test_convert_response_empty_content() {
+        let resp = OpenAIResponse {
+            id: "chatcmpl-empty".into(),
+            model: "gpt-4".into(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: OpenAIResponseMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Some(OpenAIUsage {
+                prompt_tokens: 5,
+                completion_tokens: 0,
+                total_tokens: 5,
+            }),
+        };
+        let result = convert_response(resp).unwrap();
+        assert!(result.content.is_empty());
+        assert_eq!(result.stop_reason, Some("end_turn".into()));
+    }
+
+    #[test]
+    fn test_convert_response_no_usage() {
+        let resp = OpenAIResponse {
+            id: "chatcmpl-no-usage".into(),
+            model: "gpt-4".into(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: OpenAIResponseMessage {
+                    role: "assistant".into(),
+                    content: Some("Hi".into()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+        let result = convert_response(resp).unwrap();
+        assert_eq!(result.usage.input_tokens, 0);
+        assert_eq!(result.usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn test_convert_response_length_finish_reason() {
+        let resp = OpenAIResponse {
+            id: "chatcmpl-length".into(),
+            model: "gpt-4".into(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: OpenAIResponseMessage {
+                    role: "assistant".into(),
+                    content: Some("partial".into()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("length".into()),
+            }],
+            usage: Some(OpenAIUsage {
+                prompt_tokens: 10,
+                completion_tokens: 100,
+                total_tokens: 110,
+            }),
+        };
+        let result = convert_response(resp).unwrap();
+        assert_eq!(result.stop_reason, Some("max_tokens".into()));
+    }
+
+    #[test]
+    fn test_convert_response_content_filter_finish_reason() {
+        let resp = OpenAIResponse {
+            id: "chatcmpl-filter".into(),
+            model: "gpt-4".into(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: OpenAIResponseMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("content_filter".into()),
+            }],
+            usage: None,
+        };
+        let result = convert_response(resp).unwrap();
+        assert_eq!(result.stop_reason, Some("content_filter".into()));
+    }
+
+    #[test]
+    fn test_convert_response_empty_choices_returns_error() {
+        let resp = OpenAIResponse {
+            id: "chatcmpl-no-choices".into(),
+            model: "gpt-4".into(),
+            choices: vec![],
+            usage: None,
+        };
+        let result = convert_response(resp);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AppError::ApiError(msg) => assert!(msg.contains("empty choices")),
             _ => panic!("expected ApiError"),
         }
     }
