@@ -261,4 +261,94 @@ mod tests {
             _ => panic!("expected ApiError"),
         }
     }
+
+    #[test]
+    fn test_convert_response_empty_content() {
+        let resp = OpenAIResponse {
+            id: "chatcmpl-empty".into(),
+            model: "gpt-4".into(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: OpenAIResponseMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: Some(OpenAIUsage {
+                prompt_tokens: 5,
+                completion_tokens: 0,
+                total_tokens: 5,
+            }),
+        };
+        let result = convert_response(resp);
+        assert!(result.content.is_empty());
+        assert_eq!(result.stop_reason, Some("end_turn".into()));
+    }
+
+    #[test]
+    fn test_convert_response_no_usage() {
+        let resp = OpenAIResponse {
+            id: "chatcmpl-no-usage".into(),
+            model: "gpt-4".into(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: OpenAIResponseMessage {
+                    role: "assistant".into(),
+                    content: Some("Hi".into()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".into()),
+            }],
+            usage: None,
+        };
+        let result = convert_response(resp);
+        assert_eq!(result.usage.input_tokens, 0);
+        assert_eq!(result.usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn test_convert_response_length_finish_reason() {
+        let resp = OpenAIResponse {
+            id: "chatcmpl-length".into(),
+            model: "gpt-4".into(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: OpenAIResponseMessage {
+                    role: "assistant".into(),
+                    content: Some("partial".into()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("length".into()),
+            }],
+            usage: Some(OpenAIUsage {
+                prompt_tokens: 10,
+                completion_tokens: 100,
+                total_tokens: 110,
+            }),
+        };
+        let result = convert_response(resp);
+        assert_eq!(result.stop_reason, Some("max_tokens".into()));
+    }
+
+    #[test]
+    fn test_convert_response_content_filter_finish_reason() {
+        let resp = OpenAIResponse {
+            id: "chatcmpl-filter".into(),
+            model: "gpt-4".into(),
+            choices: vec![OpenAIChoice {
+                index: 0,
+                message: OpenAIResponseMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("content_filter".into()),
+            }],
+            usage: None,
+        };
+        let result = convert_response(resp);
+        assert_eq!(result.stop_reason, Some("content_filter".into()));
+    }
 }

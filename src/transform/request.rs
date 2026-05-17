@@ -46,9 +46,10 @@ pub fn convert_request(req: AnthropicRequest) -> OpenAIRequest {
         stop: req.stop_sequences,
         temperature: req.temperature,
         top_p: req.top_p,
-        stream: req.stream,
+        stream: if req.stream { Some(true) } else { None },
         tools,
         tool_choice,
+        extra: req.extra,
     }
 }
 
@@ -225,9 +226,9 @@ fn convert_tool(tool: AnthropicTool) -> OpenAITool {
     OpenAITool {
         tool_type: "function".to_string(),
         function: OpenAIFunction {
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.input_schema,
+            name: tool.name().to_string(),
+            description: tool.description().map(|s| s.to_string()),
+            parameters: tool.input_schema(),
         },
     }
 }
@@ -248,6 +249,7 @@ fn convert_tool_choice(choice: AnthropicToolChoice) -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::anthropic::{AnthropicMessage, AnthropicSystem};
+    use std::collections::HashMap;
 
     fn make_request(stream: bool) -> AnthropicRequest {
         AnthropicRequest {
@@ -265,6 +267,7 @@ mod tests {
             top_k: Some(5),
             tools: None,
             tool_choice: None,
+            extra: HashMap::new(),
         }
     }
 
@@ -291,7 +294,13 @@ mod tests {
     #[test]
     fn test_convert_stream_flag() {
         let result = convert_request(make_request(true));
-        assert!(result.stream);
+        assert_eq!(result.stream, Some(true));
+    }
+
+    #[test]
+    fn test_stream_is_none_when_false() {
+        let result = convert_request(make_request(false));
+        assert!(result.stream.is_none());
     }
 
     #[test]
@@ -303,12 +312,34 @@ mod tests {
         assert_eq!(result.model, "claude-3-opus");
     }
 
+    #[test]
+    fn test_extra_fields_are_forwarded() {
+        let mut req = make_request(false);
+        req.extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type": "adaptive"}),
+        );
+        req.extra.insert(
+            "metadata".to_string(),
+            serde_json::json!({"user_id": "test"}),
+        );
+        let result = convert_request(req);
+        assert_eq!(
+            result.extra["thinking"],
+            serde_json::json!({"type": "adaptive"})
+        );
+        assert_eq!(
+            result.extra["metadata"],
+            serde_json::json!({"user_id": "test"})
+        );
+    }
+
     // ===== Tools conversion tests =====
 
     #[test]
     fn test_convert_tools_definition() {
         let mut req = make_request(false);
-        req.tools = Some(vec![AnthropicTool {
+        req.tools = Some(vec![AnthropicTool::Native {
             name: "get_weather".into(),
             description: Some("Get current weather".into()),
             input_schema: serde_json::json!({
@@ -387,6 +418,7 @@ mod tests {
             top_k: None,
             tools: None,
             tool_choice: None,
+            extra: HashMap::new(),
         };
         let result = convert_request(req);
         assert_eq!(result.messages.len(), 1);
@@ -431,6 +463,7 @@ mod tests {
             top_k: None,
             tools: None,
             tool_choice: None,
+            extra: HashMap::new(),
         };
         let result = convert_request(req);
         // tool_result becomes a separate "tool" role message
@@ -475,6 +508,7 @@ mod tests {
             top_k: None,
             tools: None,
             tool_choice: None,
+            extra: HashMap::new(),
         };
         let result = convert_request(req);
         // 2 tool messages + 1 user message
@@ -524,6 +558,7 @@ mod tests {
             top_k: None,
             tools: None,
             tool_choice: None,
+            extra: HashMap::new(),
         };
         let result = convert_request(req);
         assert_eq!(result.messages.len(), 1);
@@ -556,6 +591,7 @@ mod tests {
             top_k: None,
             tools: None,
             tool_choice: None,
+            extra: HashMap::new(),
         };
         let result = convert_request(req);
         assert_eq!(result.messages.len(), 1);
@@ -588,6 +624,7 @@ mod tests {
             top_k: None,
             tools: None,
             tool_choice: None,
+            extra: HashMap::new(),
         };
         let result = convert_request(req);
         assert_eq!(result.messages.len(), 2);
@@ -618,6 +655,7 @@ mod tests {
             top_k: None,
             tools: None,
             tool_choice: None,
+            extra: HashMap::new(),
         };
         let result = convert_request(req);
         let msg = &result.messages[0];

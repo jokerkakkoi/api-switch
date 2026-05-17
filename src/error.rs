@@ -95,4 +95,84 @@ mod tests {
         let response = AppError::RateLimitError("too many".into()).into_response();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
+
+    #[test]
+    fn test_invalid_request_error_returns_400() {
+        let response = AppError::InvalidRequestError("bad input".into()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_api_error_returns_502() {
+        let response = AppError::ApiError("backend failed".into()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_timeout_error_returns_504() {
+        let response = AppError::TimeoutError("slow backend".into()).into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn test_error_response_body_structure() {
+        let response = AppError::AuthenticationError("bad token".into()).into_response();
+        let (_, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "authentication_error");
+        assert_eq!(json["error"]["message"], "bad token");
+    }
+
+    #[tokio::test]
+    async fn test_from_reqwest_timeout_error() {
+        let client = reqwest::Client::new();
+        let result = client
+            .get("http://127.0.0.1:1")
+            .timeout(std::time::Duration::from_millis(1))
+            .send()
+            .await;
+        if let Err(e) = result {
+            let app_err = AppError::from(e);
+            match app_err {
+                AppError::TimeoutError(_) | AppError::ApiError(_) => {}
+                _ => panic!("expected TimeoutError or ApiError"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_from_reqwest_connect_error() {
+        let client = reqwest::Client::new();
+        let result = client
+            .get("http://127.0.0.1:1")
+            .timeout(std::time::Duration::from_millis(50))
+            .send()
+            .await;
+        if let Err(e) = result {
+            let app_err = AppError::from(e);
+            match app_err {
+                AppError::TimeoutError(_) | AppError::ApiError(_) => {}
+                _ => panic!("expected TimeoutError or ApiError"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_from_axum_http_error() {
+        let builder = axum::http::Response::builder().status(axum::http::StatusCode::OK);
+        let response = builder.body(()).unwrap();
+        let err_result = axum::http::Response::builder()
+            .header("invalid\x01header", "value")
+            .body(());
+        if let Err(e) = err_result {
+            let app_err = AppError::from(e);
+            match app_err {
+                AppError::ApiError(msg) => assert!(msg.contains("Failed to build response")),
+                _ => panic!("expected ApiError"),
+            }
+        }
+        let _ = response;
+    }
 }

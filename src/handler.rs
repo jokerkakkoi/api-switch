@@ -54,6 +54,7 @@ pub async fn anthropic_proxy_handler(
     let is_stream = anthropic_req.stream;
 
     let openai_req = convert_request(anthropic_req);
+    let openai_req_body = serde_json::to_string(&openai_req).unwrap_or_default();
 
     let fwd_headers = build_forwarded_headers(&headers, &model.app_key, &model.app_sign)?;
 
@@ -69,12 +70,12 @@ pub async fn anthropic_proxy_handler(
         .headers(fwd_headers)
         .json(&openai_req);
     if is_stream {
-        let resp = handle_stream_response(request, &body).await;
+        let resp = handle_stream_response(request, &openai_req_body).await;
         tracing::info!("Anthropic request completed (streaming)");
         tracing::debug!("Response: {:#?}", resp);
         resp
     } else {
-        let resp = handle_non_stream_response(request, &body).await;
+        let resp = handle_non_stream_response(request, &openai_req_body).await;
         tracing::info!("Anthropic request completed (non-streaming)");
         resp
     }
@@ -300,7 +301,7 @@ pub async fn health_handler(State(state): State<AppState>) -> Result<Response, A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, routing::post};
+    use axum::{Router, routing::{get, post}};
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -847,5 +848,268 @@ mod tests {
         assert_eq!(res.status(), 200);
         let forwarded_path = captured_url_clone.lock().unwrap().take().unwrap();
         assert_eq!(forwarded_path, "/v1/chat/completions");
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_handler_invalid_json_returns_400() {
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: "http://localhost".into(),
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/v1/messages", post(anthropic_proxy_handler))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", "2023-06-01")
+            .body("not valid json {{{")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 400);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid request body")
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_passthrough_handler_missing_model_returns_400() {
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: "http://localhost".into(),
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/v1/chat/completions", post(openai_passthrough_handler))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 400);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Missing 'model' field")
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_passthrough_handler_backend_error_returns_error() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|_headers: HeaderMap, _body: String| async move {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":{"message":"Internal server error","type":"server_error"}}"#,
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend_url = format!("http://{}", addr);
+
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: backend_url,
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/v1/chat/completions", post(openai_passthrough_handler))
+            .with_state(state);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "model": "qwen35-397b",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 500);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Internal server error")
+        );
+    }
+
+    #[tokio::test]
+    async fn health_handler_returns_backend_status() {
+        let app = Router::new().route(
+            "/health",
+            get(|| async move { (axum::http::StatusCode::OK, "OK") }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend_url = format!("http://{}", addr);
+
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: backend_url,
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/health", get(health_handler))
+            .with_state(state);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .get(format!("http://{}/health", proxy_addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        let body = res.text().await.unwrap();
+        assert_eq!(body, "OK");
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_handler_backend_error_returns_error() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|_headers: HeaderMap, _body: String| async move {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":{"message":"Backend failed","type":"server_error"}}"#,
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend_url = format!("http://{}", addr);
+
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: backend_url,
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/v1/messages", post(anthropic_proxy_handler))
+            .with_state(state);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": "qwen35-397b",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 502);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Backend failed")
+        );
     }
 }

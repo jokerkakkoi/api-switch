@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Request body sent to OpenAI-compatible backend.
 #[derive(Debug, Serialize)]
@@ -13,11 +14,14 @@ pub struct OpenAIRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
-    pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<OpenAITool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,13 +204,15 @@ mod tests {
             stop: None,
             temperature: None,
             top_p: None,
-            stream: false,
+            stream: None,
             tools: None,
             tool_choice: None,
+            extra: HashMap::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"model\":\"gpt-4\""));
-        assert!(json.contains("\"stream\":false"));
+        // stream should not appear when None
+        assert!(!json.contains("\"stream\""));
         // tools and tool_choice should not appear when None
         assert!(!json.contains("\"tools\""));
         assert!(!json.contains("\"tool_choice\""));
@@ -226,7 +232,7 @@ mod tests {
             stop: None,
             temperature: None,
             top_p: None,
-            stream: false,
+            stream: Some(true),
             tools: Some(vec![OpenAITool {
                 tool_type: "function".into(),
                 function: OpenAIFunction {
@@ -236,11 +242,48 @@ mod tests {
                 },
             }]),
             tool_choice: Some(serde_json::json!("auto")),
+            extra: HashMap::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
         assert!(json.contains("\"get_weather\""));
+        assert!(json.contains("\"stream\":true"));
         assert!(json.contains("\"tool_choice\":\"auto\""));
+    }
+
+    #[test]
+    fn test_serialize_openai_request_with_extra_fields() {
+        let mut extra = HashMap::new();
+        extra.insert(
+            "thinking".to_string(),
+            serde_json::json!({"type": "adaptive"}),
+        );
+        extra.insert(
+            "metadata".to_string(),
+            serde_json::json!({"user_id": "test"}),
+        );
+        let req = OpenAIRequest {
+            model: "gpt-4".into(),
+            messages: vec![OpenAIMessage {
+                role: "user".into(),
+                content: OpenAIContent::Text("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            max_tokens: Some(100),
+            stop: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+            extra,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"thinking\""));
+        assert!(json.contains("\"adaptive\""));
+        assert!(json.contains("\"metadata\""));
+        assert!(json.contains("\"user_id\""));
     }
 
     #[test]
@@ -334,5 +377,30 @@ mod tests {
                 .unwrap(),
             "get_weather"
         );
+    }
+
+    #[test]
+    fn test_deserialize_openai_error_response() {
+        let json = r#"{
+            "error": {
+                "message": "Incorrect API key provided",
+                "type": "invalid_request_error"
+            }
+        }"#;
+        let err: OpenAIErrorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(err.error.message, "Incorrect API key provided");
+        assert_eq!(err.error.error_type.as_ref().unwrap(), "invalid_request_error");
+    }
+
+    #[test]
+    fn test_deserialize_openai_response_no_usage() {
+        let json = r#"{
+            "id": "chatcmpl-no-usage",
+            "model": "gpt-4",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}]
+        }"#;
+        let resp: OpenAIResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.id, "chatcmpl-no-usage");
+        assert!(resp.usage.is_none());
     }
 }

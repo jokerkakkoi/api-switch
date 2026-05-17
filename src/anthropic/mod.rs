@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Incoming Anthropic Messages API request body.
 #[derive(Debug, Deserialize)]
@@ -21,6 +22,8 @@ pub struct AnthropicRequest {
     pub tools: Option<Vec<AnthropicTool>>,
     #[serde(default)]
     pub tool_choice: Option<AnthropicToolChoice>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,12 +105,59 @@ pub struct SystemContentBlock {
 }
 
 /// Tool definition in Anthropic format.
+/// Also accepts OpenAI-style tools ({ "type": "function", "function": { ... } })
+/// by deserializing from either format.
 #[derive(Debug, Deserialize, Clone)]
-pub struct AnthropicTool {
+#[serde(untagged)]
+pub enum AnthropicTool {
+    /// OpenAI-style format: { "type": "function", "function": { "name": ..., "parameters": ... } }
+    OpenAIStyle {
+        #[serde(rename = "type")]
+        _tool_type: String,
+        function: AnthropicToolFunction,
+    },
+    /// Anthropic native format: { "name": ..., "input_schema": ... }
+    Native {
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(rename = "input_schema")]
+        input_schema: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AnthropicToolFunction {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
-    pub input_schema: serde_json::Value,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+impl AnthropicTool {
+    pub fn name(&self) -> &str {
+        match self {
+            AnthropicTool::OpenAIStyle { function, .. } => &function.name,
+            AnthropicTool::Native { name, .. } => name,
+        }
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        match self {
+            AnthropicTool::OpenAIStyle { function, .. } => function.description.as_deref(),
+            AnthropicTool::Native { description, .. } => description.as_deref(),
+        }
+    }
+
+    pub fn input_schema(&self) -> serde_json::Value {
+        match self {
+            AnthropicTool::OpenAIStyle { function, .. } => {
+                function.parameters.clone().unwrap_or(serde_json::json!({}))
+            }
+            AnthropicTool::Native { input_schema, .. } => input_schema.clone(),
+        }
+    }
 }
 
 /// Tool choice in Anthropic format.
@@ -282,11 +332,63 @@ mod tests {
         let req: AnthropicRequest = serde_json::from_str(json).unwrap();
         let tools = req.tools.unwrap();
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "get_weather");
+        assert_eq!(tools[0].name(), "get_weather");
         match req.tool_choice.unwrap() {
             AnthropicToolChoice::Auto => {}
             _ => panic!("expected Auto"),
         }
+    }
+
+    #[test]
+    fn test_deserialize_request_with_openai_style_tools() {
+        let json = r#"{
+            "model": "claude-3",
+            "messages": [{"role": "user", "content": "What is the weather?"}],
+            "max_tokens": 1024,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get the current weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"}
+                            },
+                            "required": ["location"]
+                        }
+                    }
+                }
+            ],
+            "tool_choice": {"type": "auto"}
+        }"#;
+        let req: AnthropicRequest = serde_json::from_str(json).unwrap();
+        let tools = req.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "get_weather");
+        assert_eq!(tools[0].description().unwrap(), "Get the current weather");
+        assert_eq!(tools[0].input_schema()["type"], "object");
+        match req.tool_choice.unwrap() {
+            AnthropicToolChoice::Auto => {}
+            _ => panic!("expected Auto"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_request_with_extra_fields() {
+        let json = r#"{
+            "model": "claude-3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1024,
+            "metadata": {"user_id": "test"},
+            "thinking": {"type": "adaptive"},
+            "context_management": {"edits": []}
+        }"#;
+        let req: AnthropicRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.extra["metadata"]["user_id"], "test");
+        assert_eq!(req.extra["thinking"]["type"], "adaptive");
+        assert!(req.extra.contains_key("context_management"));
     }
 
     #[test]
@@ -372,5 +474,66 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"tool_use\""));
         assert!(json.contains("\"get_weather\""));
+    }
+
+    #[test]
+    fn test_deserialize_system_as_content_list() {
+        let json = r#"{
+            "model": "claude-3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": [{"type": "text", "text": "You are helpful."}],
+            "max_tokens": 100
+        }"#;
+        let req: AnthropicRequest = serde_json::from_str(json).unwrap();
+        match req.system.unwrap() {
+            AnthropicSystem::ContentList(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].text.as_ref().unwrap(), "You are helpful.");
+            }
+            _ => panic!("expected ContentList"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_image_content_block() {
+        let json = r#"[
+            {"type": "text", "text": "What is this?"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBOR..."}}
+        ]"#;
+        let blocks: Vec<AnthropicContentBlock> = serde_json::from_str(json).unwrap();
+        assert_eq!(blocks.len(), 2);
+        match &blocks[1] {
+            AnthropicContentBlock::Image { source } => {
+                assert_eq!(source.media_type, "image/png");
+                assert_eq!(source.data, "iVBOR...");
+            }
+            _ => panic!("expected Image"),
+        }
+    }
+
+    #[test]
+    fn test_deserialize_tool_result_with_is_error_and_blocks() {
+        let json = r#"[
+            {"type": "tool_result", "tool_use_id": "toolu_01", "is_error": true, "content": [{"type": "text", "text": "Error occurred"}]}
+        ]"#;
+        let blocks: Vec<AnthropicContentBlock> = serde_json::from_str(json).unwrap();
+        match &blocks[0] {
+            AnthropicContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_use_id, "toolu_01");
+                assert_eq!(is_error.unwrap(), true);
+                match content.as_ref().unwrap() {
+                    ToolResultContent::Blocks(blks) => {
+                        assert_eq!(blks.len(), 1);
+                        assert_eq!(blks[0].text.as_ref().unwrap(), "Error occurred");
+                    }
+                    _ => panic!("expected Blocks"),
+                }
+            }
+            _ => panic!("expected ToolResult"),
+        }
     }
 }
