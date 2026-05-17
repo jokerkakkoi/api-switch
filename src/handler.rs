@@ -92,7 +92,7 @@ async fn handle_non_stream_response(
             .json()
             .await
             .map_err(|e| AppError::ApiError(format!("Failed to parse backend response: {}", e)))?;
-        let anthropic_resp = convert_response(openai_resp);
+        let anthropic_resp = convert_response(openai_resp)?;
         Ok(Json(anthropic_resp).into_response())
     } else {
         let status_code = status.as_u16();
@@ -301,7 +301,10 @@ pub async fn health_handler(State(state): State<AppState>) -> Result<Response, A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, routing::{get, post}};
+    use axum::{
+        Router,
+        routing::{get, post},
+    };
     use serde_json::json;
     use tokio::net::TcpListener;
 
