@@ -389,7 +389,10 @@ mod tests {
         }"#;
         let err: OpenAIErrorResponse = serde_json::from_str(json).unwrap();
         assert_eq!(err.error.message, "Incorrect API key provided");
-        assert_eq!(err.error.error_type.as_ref().unwrap(), "invalid_request_error");
+        assert_eq!(
+            err.error.error_type.as_ref().unwrap(),
+            "invalid_request_error"
+        );
     }
 
     #[test]
