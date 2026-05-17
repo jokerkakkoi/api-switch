@@ -1,4 +1,5 @@
 /target
 .worktrees/
 config.yaml
-*.exe
+test/
+docs/superpowers/
