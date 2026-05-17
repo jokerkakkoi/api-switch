@@ -3,52 +3,53 @@
 [![Rust](https://img.shields.io/badge/rust-stable-blue.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-基于 Rust 的高性能 HTTP 网关，将 [Anthropic Messages API](https://docs.anthropic.com/en/api/messages) 请求转换为 [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat) 格式，转发至 OpenAI 兼容的后端，并将响应转换回 Anthropic 格式。支持流式（SSE）和非流式两种模式。
+基于 Rust 的高性能 HTTP 网关，将 [Anthropic Messages API](https://docs.anthropic.com/en/api/messages) 和 [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat) 格式，转发至**特殊OpenAI 兼容**的后端,支持流式（SSE）和非流式两种模式，全面支持接入各大主流AI Coding Agent。
+
+> 特殊格式指请求头鉴权方式非Authorization请求格式，而是**AppKey**和**AppSign**认证的请求头
 
 ## 特性
 
 - ✅ 完整的 Anthropic Messages API 支持
+- ✅ OpenAI Chat Completions API 透明代理
 - ✅ 流式（SSE）和非流式请求
-- ✅ 多令牌路由（不同令牌转发到不同后端）
 - ✅ 请求头透传（支持 traceId 等追踪头）
 - ✅ 图片内容转换
 - ✅ 系统提示词转换
-- ✅ 健康检查端点
-- ✅ 详细的错误响应
+- ✅ 健康检查端点（代理到后端）
+- ✅ 后端 HTTP 客户端超时 300s
+- ✅ 禁用代理（no_proxy）
 
 ## 快速开始
 
-### 前置条件
-
-- Rust 工具链（2024 edition）
-- 一个 OpenAI 兼容的后端地址
-
 ### 配置文件
 
-创建 `config.yaml` **(重要，必须和exe同文件夹下)**：
+- 从release中获取最新的二进制包
+- 拷贝配置文件`cp config.yaml.example config.yaml` **(重要，必须和exe同文件夹下)**
+- 更新配置文件，参考如下：
 
 ```yaml
-app_key: "1******1"
-app_sign: "f*********8"
-openai_base_url: http://******:***/******/ # url不要带/v1/chat/completions
+app_key: "1******1"							  # 换成自己的
+app_sign: "f*********8"						  # 换成自己的
+openai_base_url: http://******:***/******/ 	  # url不要带/v1/chat/completions
 port: 3000
 ```
 
-### 运行
+- 运行
 
 ```bash
-export CONFIG_PATH="./config.yaml"            # 默认: ./config.yaml
-cargo run
+export CONFIG_PATH="./config.yaml"            # 配置文件位置，可不更改，默认: ./config.yaml
+.\api-switch.exe							  # 根据平台不同会不一样
 ```
 
-服务监听 `http://[IP_ADDRESS]`。
+服务监听 `http://0.0.0.0:[PORT]`。
 
 ### 测试请求
 
 **非流式请求：**
+
 ```bash
 curl -X POST http://localhost:3000/v1/messages \
-  -H "Authorization: Bearer sk-ant-your-token" \
+  -H "Authorization: Bearer 12345" \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
@@ -77,14 +78,27 @@ curl -X POST http://localhost:3000/v1/messages \
 curl http://localhost:3000/health
 ```
 
+**OpenAI 透明代理：**
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
 ## API
 
 | 方法 | 路径 | 说明 |
 |--------|------|-------------|
 | `POST` | `/v1/messages` | Anthropic → OpenAI 协议转换 |
-| `GET`  | `/health` | 健康检查（主要为了测试网络） |
+| `POST` | `/v1/chat/completions` | OpenAI 透明代理（无协议转换，直接透传） |
+| `GET`  | `/health` | 健康检查（代理到后端） |
 
 ## 工作原理
+
+### `/v1/messages` — Anthropic → OpenAI 协议转换
 
 ```
 客户端（Anthropic 格式）
@@ -92,14 +106,42 @@ curl http://localhost:3000/health
       ▼
 POST /v1/messages
       │
-      ├─ 1. 从 Authorization 头提取 Bearer token
-      ├─ 2. 在配置中查找对应的后端凭证（App-Key, App-Sign）
-      ├─ 3. 反序列化 Anthropic 请求体
-      ├─ 4. 转换 Anthropic 请求 → OpenAI 请求
-      ├─ 5. 转发到 {BASE_URL}/v1/chat/completions
-      │      请求头: App-Key + App-Sign + 原始头（移除 Authorization）
-      ├─ 6. 转换 OpenAI 响应 → Anthropic 响应
-      └─ 7. 返回客户端
+      ├─ 1. 解析 Anthropic 请求体
+      ├─ 2. 转换 Anthropic 请求 → OpenAI 请求
+      ├─ 3. 构建转发请求头：App-Key + App-Sign + 原始头（移除跳转头）
+      ├─ 4. 转发到 {openai_base_url}/v1/chat/completions
+      ├─ 5. 转换 OpenAI 响应 → Anthropic 响应
+      │     - 非流式：直接转换 JSON
+      │     - 流式：SSE 状态机转换 OpenAI chunk → Anthropic 事件
+      └─ 6. 返回客户端
+```
+
+### `/v1/chat/completions` — OpenAI 透明代理
+
+```
+客户端（OpenAI 格式）
+      │
+      ▼
+POST /v1/chat/completions
+      │
+      ├─ 1. 构建转发请求头：App-Key + App-Sign + 原始头
+      ├─ 2. 直接透传请求体到 {openai_base_url}/v1/chat/completions
+      ├─ 3. 透传后端响应状态码和响应头
+      ├─ 4. 透传响应体（流式/非流式自动检测）
+      └─ 5. 返回客户端
+```
+
+### `/health` — 健康检查
+
+```
+客户端
+  │
+  ▼
+GET /health
+  │
+  ├─ 1. 转发到 {openai_base_url}/health
+  ├─ 2. 透传后端响应状态码和响应体
+  └─ 3. 返回客户端
 ```
 
 ## 协议映射
@@ -195,19 +237,20 @@ cargo test -- --nocapture
 
 ```
 src/
-├── main.rs           # 入口点，路由注册，AxumState 初始化
-├── config.rs         # YAML 配置加载，令牌→凭证查找
-├── error.rs          # AppError 枚举（27 种错误变体）
-├── handler.rs        # /v1/messages 和 /health 处理器
+├── main.rs           # 入口点，路由注册，AppState 初始化
+├── config.rs         # YAML 配置加载（AppConfig: app_key, app_sign, openai_base_url, port）
+├── error.rs          # AppError 枚举，Anthropic 风格错误响应
+├── handler.rs        # 路由处理器（messages, chat_completions, health）
 ├── anthropic/        # Anthropic 协议定义
 │   └── mod.rs        # MessagesRequest, MessagesResponse, SSE 事件
 ├── openai/           # OpenAI 协议定义
-│   └── mod.rs        # ChatRequest, ChatResponse, SSE 块
+│   └── mod.rs        # ChatRequest, ChatResponse, OpenAISSEChunk
 └── transform/        # 协议转换
     ├── mod.rs        # 模块导出
     ├── request.rs    # Anthropic → OpenAI 请求转换
     ├── response.rs   # OpenAI → Anthropic 响应转换
-    └── stream.rs     # SSE 流式转换（状态机）
+    ├── stream.rs     # SSE 流式转换（状态机）
+    └── headers.rs    # 请求头转发逻辑
 ```
 
 ## 许可证
