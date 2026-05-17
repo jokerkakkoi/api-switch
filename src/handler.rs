@@ -300,7 +300,7 @@ mod tests {
     use super::*;
     use axum::{
         Router,
-        routing::{get, post},
+        routing::post,
     };
     use serde_json::json;
     use tokio::net::TcpListener;
