@@ -9,7 +9,8 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::anthropic::{AnthropicSSEEvent, AnthropicRequest};
+use crate::anthropic::{AnthropicRequest, AnthropicSSEEvent};
+use crate::anthropic::{MessageDeltaData, OutputUsage};
 use crate::config::{AppConfig, ModelConfig};
 use crate::error::AppError;
 use crate::openai::OpenAISSEChunk;
@@ -17,7 +18,6 @@ use crate::transform::headers::build_forwarded_headers;
 use crate::transform::request::convert_request;
 use crate::transform::response::{convert_response, map_openai_error};
 use crate::transform::stream::{StreamState, convert_stream_chunk, format_sse};
-use crate::anthropic::{MessageDeltaData, OutputUsage};
 
 const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 
@@ -32,14 +32,6 @@ fn resolve_model<'a>(state: &'a AppState, model_name: &str) -> Result<&'a ModelC
         .config
         .find_model(model_name)
         .ok_or_else(|| AppError::InvalidRequestError(format!("Unknown model: {}", model_name)))
-}
-
-fn resolve_health_base_url(config: &AppConfig) -> String {
-    config
-        .models
-        .first()
-        .map(|m| m.base_url.trim_end_matches('/').to_string())
-        .unwrap_or_default()
 }
 
 /// POST /v1/messages — main protocol conversion endpoint
@@ -169,20 +161,22 @@ async fn handle_stream_response(
                     tracing::error!("[/v1/messages SSE] stream error: {}", e);
                     if state.started {
                         if state.content_block_open {
-                            let event = axum::response::sse::Event::default()
-                                .data(format_sse(&AnthropicSSEEvent::ContentBlockStop {
+                            let event = axum::response::sse::Event::default().data(format_sse(
+                                &AnthropicSSEEvent::ContentBlockStop {
                                     index: state.content_index,
-                                }));
+                                },
+                            ));
                             let _ = tx.send(Ok(event)).await;
                         }
-                        let event = axum::response::sse::Event::default()
-                            .data(format_sse(&AnthropicSSEEvent::MessageDelta {
+                        let event = axum::response::sse::Event::default().data(format_sse(
+                            &AnthropicSSEEvent::MessageDelta {
                                 delta: MessageDeltaData {
                                     stop_reason: "error".to_string(),
                                     stop_sequence: None,
                                 },
                                 usage: OutputUsage { output_tokens: 0 },
-                            }));
+                            },
+                        ));
                         let _ = tx.send(Ok(event)).await;
                         let event = axum::response::sse::Event::default()
                             .data(format_sse(&AnthropicSSEEvent::MessageStop));
@@ -268,7 +262,9 @@ pub async fn openai_passthrough_handler(
                     }
                     Err(e) => {
                         tracing::error!("[/v1/chat/completions SSE] stream error: {}", e);
-                        let _ = tx.send(Ok(axum::body::Bytes::from("data: [DONE]\n\n"))).await;
+                        let _ = tx
+                            .send(Ok(axum::body::Bytes::from("data: [DONE]\n\n")))
+                            .await;
                         return;
                     }
                 }
@@ -299,35 +295,12 @@ pub async fn openai_passthrough_handler(
     }
 }
 
-/// GET /health — proxy health check to the configured backend
-pub async fn health_handler(State(state): State<AppState>) -> Result<Response, AppError> {
-    let base_url = resolve_health_base_url(&state.config);
-    let backend_url = format!("{}/health", base_url);
-
-    let response = state
-        .client
-        .get(&backend_url)
-        .send()
-        .await
-        .map_err(|e| AppError::ApiError(format!("Health check failed: {}", e)))?;
-
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-
-    Ok((
-        axum::http::StatusCode::from_u16(status.as_u16())
-            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
-        body,
-    )
-        .into_response())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{
         Router,
-        routing::{get, post},
+        routing::post,
     };
     use serde_json::json;
     use tokio::net::TcpListener;
@@ -1029,54 +1002,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_handler_returns_backend_status() {
-        let app = Router::new().route(
-            "/health",
-            get(|| async move { (axum::http::StatusCode::OK, "OK") }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let backend_url = format!("http://{}", addr);
-
-        let config = Arc::new(AppConfig {
-            models: vec![ModelConfig {
-                name: "qwen35-397b".into(),
-                app_key: "key".into(),
-                app_sign: "sign".into(),
-                base_url: backend_url,
-            }],
-            port: 0,
-        });
-        let state = AppState {
-            config,
-            client: Client::new(),
-        };
-        let app = Router::new()
-            .route("/health", get(health_handler))
-            .with_state(state);
-
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(proxy_listener, app).await.unwrap();
-        });
-
-        let client = reqwest::Client::new();
-        let res = client
-            .get(format!("http://{}/health", proxy_addr))
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(res.status(), 200);
-        let body = res.text().await.unwrap();
-        assert_eq!(body, "OK");
-    }
-
-    #[tokio::test]
     async fn anthropic_proxy_handler_backend_error_returns_error() {
         let app = Router::new().route(
             "/v1/chat/completions",
@@ -1207,9 +1132,18 @@ mod tests {
         assert_eq!(res.status(), 200);
         let body = res.text().await.unwrap();
 
-        assert!(body.contains("event: message_start"), "should have message_start");
-        assert!(body.contains("event: message_delta"), "should have message_delta with stop_reason on stream error");
-        assert!(body.contains("event: message_stop"), "should have message_stop on stream error");
+        assert!(
+            body.contains("event: message_start"),
+            "should have message_start"
+        );
+        assert!(
+            body.contains("event: message_delta"),
+            "should have message_delta with stop_reason on stream error"
+        );
+        assert!(
+            body.contains("event: message_stop"),
+            "should have message_stop on stream error"
+        );
     }
 
     #[tokio::test]
@@ -1278,6 +1212,9 @@ mod tests {
         let body = res.text().await.unwrap();
 
         assert!(body.contains("data:"), "should have SSE data");
-        assert!(body.contains("error") || body.contains("[DONE]"), "should signal error or completion on stream disconnect");
+        assert!(
+            body.contains("error") || body.contains("[DONE]"),
+            "should signal error or completion on stream disconnect"
+        );
     }
 }

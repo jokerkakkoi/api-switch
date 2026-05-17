@@ -1,4 +1,5 @@
 mod anthropic;
+mod api;
 mod config;
 mod error;
 mod handler;
@@ -29,7 +30,7 @@ async fn main() {
             "/v1/chat/completions",
             post(handler::openai_passthrough_handler),
         )
-        .route("/health", get(handler::health_handler))
+        .route("/health", get(api::health::health_handler))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", port);
