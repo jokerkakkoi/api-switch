@@ -3,6 +3,8 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName};
 use axum::response::{IntoResponse, Response, Sse};
 use reqwest::Client;
+use serde::Serialize;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -27,19 +29,17 @@ pub struct AppState {
     pub client: Client,
 }
 
+#[derive(Serialize)]
+pub struct HealthResponse {
+    health: bool,
+    network: HashMap<String, bool>,
+}
+
 fn resolve_model<'a>(state: &'a AppState, model_name: &str) -> Result<&'a ModelConfig, AppError> {
     state
         .config
         .find_model(model_name)
         .ok_or_else(|| AppError::InvalidRequestError(format!("Unknown model: {}", model_name)))
-}
-
-fn resolve_health_base_url(config: &AppConfig) -> String {
-    config
-        .models
-        .first()
-        .map(|m| m.base_url.trim_end_matches('/').to_string())
-        .unwrap_or_default()
 }
 
 /// POST /v1/messages — main protocol conversion endpoint
@@ -299,27 +299,38 @@ pub async fn openai_passthrough_handler(
     }
 }
 
-/// GET /health — proxy health check to the configured backend
-pub async fn health_handler(State(state): State<AppState>) -> Result<Response, AppError> {
-    let base_url = resolve_health_base_url(&state.config);
-    let backend_url = format!("{}/health", base_url);
+/// GET /health — gateway self-health and per-model network checks
+pub async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResponse>, AppError> {
+    let health_timeout = std::time::Duration::from_secs(1);
 
-    let response = state
-        .client
-        .get(&backend_url)
-        .send()
-        .await
-        .map_err(|e| AppError::ApiError(format!("Health check failed: {}", e)))?;
+    let mut join_set = tokio::task::JoinSet::new();
 
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    for model in &state.config.models {
+        let name = model.name.clone();
+        let base_url = model.base_url.trim_end_matches('/').to_string();
+        let client = state.client.clone();
+        join_set.spawn(async move {
+            let reachable = client
+                .get(&base_url)
+                .timeout(health_timeout)
+                .send()
+                .await
+                .is_ok();
+            (name, reachable)
+        });
+    }
 
-    Ok((
-        axum::http::StatusCode::from_u16(status.as_u16())
-            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
-        body,
-    )
-        .into_response())
+    let mut network = HashMap::new();
+    while let Some(result) = join_set.join_next().await {
+        if let Ok((name, reachable)) = result {
+            network.insert(name, reachable);
+        }
+    }
+
+    Ok(Json(HealthResponse {
+        health: true,
+        network,
+    }))
 }
 
 #[cfg(test)]
