@@ -133,12 +133,11 @@ mod tests {
             .timeout(std::time::Duration::from_millis(1))
             .send()
             .await;
-        if let Err(e) = result {
-            let app_err = AppError::from(e);
-            match app_err {
-                AppError::TimeoutError(_) | AppError::ApiError(_) => {}
-                _ => panic!("expected TimeoutError or ApiError"),
-            }
+        let e = result.expect_err("expected request to fail");
+        let app_err = AppError::from(e);
+        match app_err {
+            AppError::TimeoutError(_) | AppError::ApiError(_) => {}
+            _ => panic!("expected TimeoutError or ApiError"),
         }
     }
 
@@ -150,29 +149,24 @@ mod tests {
             .timeout(std::time::Duration::from_millis(50))
             .send()
             .await;
-        if let Err(e) = result {
-            let app_err = AppError::from(e);
-            match app_err {
-                AppError::TimeoutError(_) | AppError::ApiError(_) => {}
-                _ => panic!("expected TimeoutError or ApiError"),
-            }
+        let e = result.expect_err("expected request to fail");
+        let app_err = AppError::from(e);
+        match app_err {
+            AppError::TimeoutError(_) | AppError::ApiError(_) => {}
+            _ => panic!("expected TimeoutError or ApiError"),
         }
     }
 
     #[test]
     fn test_from_axum_http_error() {
-        let builder = axum::http::Response::builder().status(axum::http::StatusCode::OK);
-        let response = builder.body(()).unwrap();
         let err_result = axum::http::Response::builder()
             .header("invalid\x01header", "value")
             .body(());
-        if let Err(e) = err_result {
-            let app_err = AppError::from(e);
-            match app_err {
-                AppError::ApiError(msg) => assert!(msg.contains("Failed to build response")),
-                _ => panic!("expected ApiError"),
-            }
+        let e = err_result.expect_err("expected request to fail");
+        let app_err = AppError::from(e);
+        match app_err {
+            AppError::ApiError(msg) => assert!(msg.contains("Failed to build response")),
+            _ => panic!("expected ApiError"),
         }
-        let _ = response;
     }
 }
