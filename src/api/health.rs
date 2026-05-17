@@ -13,7 +13,9 @@ pub struct HealthResponse {
 }
 
 /// GET /health — gateway self-health and per-model network checks
-pub async fn health_handler(State(state): State<AppState>) -> Result<Json<HealthResponse>, AppError> {
+pub async fn health_handler(
+    State(state): State<AppState>,
+) -> Result<Json<HealthResponse>, AppError> {
     let health_timeout = std::time::Duration::from_secs(1);
 
     let mut join_set = tokio::task::JoinSet::new();
@@ -49,10 +51,7 @@ pub async fn health_handler(State(state): State<AppState>) -> Result<Json<Health
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        Router,
-        routing::get,
-    };
+    use axum::{Router, routing::get};
     use reqwest::Client;
     use std::sync::Arc;
     use tokio::net::TcpListener;
@@ -61,10 +60,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_handler_returns_gateway_health_and_network_status() {
-        let app = Router::new().route(
-            "/",
-            get(|| async move { axum::http::StatusCode::OK }),
-        );
+        let app = Router::new().route("/", get(|| async move { axum::http::StatusCode::OK }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let backend_url = format!("http://{}", addr);
@@ -120,14 +116,12 @@ mod tests {
     #[tokio::test]
     async fn health_handler_network_false_for_unreachable_model() {
         let config = Arc::new(AppConfig {
-            models: vec![
-                ModelConfig {
-                    name: "qwen35-397b".into(),
-                    app_key: "key".into(),
-                    app_sign: "sign".into(),
-                    base_url: "http://127.0.0.1:1".into(), // unreachable port
-                },
-            ],
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: "http://127.0.0.1:1".into(), // unreachable port
+            }],
             port: 0,
         });
         let state = AppState {

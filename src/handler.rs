@@ -9,7 +9,8 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::anthropic::{AnthropicSSEEvent, AnthropicRequest};
+use crate::anthropic::{AnthropicRequest, AnthropicSSEEvent};
+use crate::anthropic::{MessageDeltaData, OutputUsage};
 use crate::config::{AppConfig, ModelConfig};
 use crate::error::AppError;
 use crate::openai::OpenAISSEChunk;
@@ -17,7 +18,6 @@ use crate::transform::headers::build_forwarded_headers;
 use crate::transform::request::convert_request;
 use crate::transform::response::{convert_response, map_openai_error};
 use crate::transform::stream::{StreamState, convert_stream_chunk, format_sse};
-use crate::anthropic::{MessageDeltaData, OutputUsage};
 
 const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 
@@ -161,20 +161,22 @@ async fn handle_stream_response(
                     tracing::error!("[/v1/messages SSE] stream error: {}", e);
                     if state.started {
                         if state.content_block_open {
-                            let event = axum::response::sse::Event::default()
-                                .data(format_sse(&AnthropicSSEEvent::ContentBlockStop {
+                            let event = axum::response::sse::Event::default().data(format_sse(
+                                &AnthropicSSEEvent::ContentBlockStop {
                                     index: state.content_index,
-                                }));
+                                },
+                            ));
                             let _ = tx.send(Ok(event)).await;
                         }
-                        let event = axum::response::sse::Event::default()
-                            .data(format_sse(&AnthropicSSEEvent::MessageDelta {
+                        let event = axum::response::sse::Event::default().data(format_sse(
+                            &AnthropicSSEEvent::MessageDelta {
                                 delta: MessageDeltaData {
                                     stop_reason: "error".to_string(),
                                     stop_sequence: None,
                                 },
                                 usage: OutputUsage { output_tokens: 0 },
-                            }));
+                            },
+                        ));
                         let _ = tx.send(Ok(event)).await;
                         let event = axum::response::sse::Event::default()
                             .data(format_sse(&AnthropicSSEEvent::MessageStop));
@@ -260,7 +262,9 @@ pub async fn openai_passthrough_handler(
                     }
                     Err(e) => {
                         tracing::error!("[/v1/chat/completions SSE] stream error: {}", e);
-                        let _ = tx.send(Ok(axum::body::Bytes::from("data: [DONE]\n\n"))).await;
+                        let _ = tx
+                            .send(Ok(axum::body::Bytes::from("data: [DONE]\n\n")))
+                            .await;
                         return;
                     }
                 }
@@ -1128,9 +1132,18 @@ mod tests {
         assert_eq!(res.status(), 200);
         let body = res.text().await.unwrap();
 
-        assert!(body.contains("event: message_start"), "should have message_start");
-        assert!(body.contains("event: message_delta"), "should have message_delta with stop_reason on stream error");
-        assert!(body.contains("event: message_stop"), "should have message_stop on stream error");
+        assert!(
+            body.contains("event: message_start"),
+            "should have message_start"
+        );
+        assert!(
+            body.contains("event: message_delta"),
+            "should have message_delta with stop_reason on stream error"
+        );
+        assert!(
+            body.contains("event: message_stop"),
+            "should have message_stop on stream error"
+        );
     }
 
     #[tokio::test]
@@ -1199,6 +1212,9 @@ mod tests {
         let body = res.text().await.unwrap();
 
         assert!(body.contains("data:"), "should have SSE data");
-        assert!(body.contains("error") || body.contains("[DONE]"), "should signal error or completion on stream disconnect");
+        assert!(
+            body.contains("error") || body.contains("[DONE]"),
+            "should signal error or completion on stream disconnect"
+        );
     }
 }
