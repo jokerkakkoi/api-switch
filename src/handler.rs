@@ -1040,25 +1040,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_handler_returns_backend_status() {
+    async fn health_handler_returns_gateway_health_and_network_status() {
         let app = Router::new().route(
-            "/health",
-            get(|| async move { (axum::http::StatusCode::OK, "OK") }),
+            "/",
+            get(|| async move { axum::http::StatusCode::OK }),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let backend_url = format!("http://{}", addr);
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let backend_url = format!("http://{}", addr);
 
         let config = Arc::new(AppConfig {
-            models: vec![ModelConfig {
-                name: "qwen35-397b".into(),
-                app_key: "key".into(),
-                app_sign: "sign".into(),
-                base_url: backend_url,
-            }],
+            models: vec![
+                ModelConfig {
+                    name: "qwen35-397b".into(),
+                    app_key: "key".into(),
+                    app_sign: "sign".into(),
+                    base_url: backend_url.clone(),
+                },
+                ModelConfig {
+                    name: "glm-5".into(),
+                    app_key: "key2".into(),
+                    app_sign: "sign2".into(),
+                    base_url: backend_url,
+                },
+            ],
             port: 0,
         });
         let state = AppState {
@@ -1083,8 +1091,83 @@ mod tests {
             .unwrap();
 
         assert_eq!(res.status(), 200);
-        let body = res.text().await.unwrap();
-        assert_eq!(body, "OK");
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body["health"], true);
+        assert_eq!(body["network"]["qwen35-397b"], true);
+        assert_eq!(body["network"]["glm-5"], true);
+    }
+
+    #[tokio::test]
+    async fn health_handler_network_false_for_unreachable_model() {
+        let config = Arc::new(AppConfig {
+            models: vec![
+                ModelConfig {
+                    name: "qwen35-397b".into(),
+                    app_key: "key".into(),
+                    app_sign: "sign".into(),
+                    base_url: "http://127.0.0.1:1".into(), // unreachable port
+                },
+            ],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/health", get(health_handler))
+            .with_state(state);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .get(format!("http://{}/health", proxy_addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body["health"], true);
+        assert_eq!(body["network"]["qwen35-397b"], false);
+    }
+
+    #[tokio::test]
+    async fn health_handler_empty_models_returns_empty_network() {
+        let config = Arc::new(AppConfig {
+            models: vec![],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/health", get(health_handler))
+            .with_state(state);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .get(format!("http://{}/health", proxy_addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body["health"], true);
+        assert!(body["network"].as_object().unwrap().is_empty());
     }
 
     #[tokio::test]
