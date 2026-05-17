@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::anthropic::AnthropicRequest;
+use crate::anthropic::{AnthropicSSEEvent, AnthropicRequest};
 use crate::config::{AppConfig, ModelConfig};
 use crate::error::AppError;
 use crate::openai::OpenAISSEChunk;
@@ -17,6 +17,7 @@ use crate::transform::headers::build_forwarded_headers;
 use crate::transform::request::convert_request;
 use crate::transform::response::{convert_response, map_openai_error};
 use crate::transform::stream::{StreamState, convert_stream_chunk, format_sse};
+use crate::anthropic::{MessageDeltaData, OutputUsage};
 
 const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 
@@ -164,7 +165,29 @@ async fn handle_stream_response(
                         }
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    tracing::error!("[/v1/messages SSE] stream error: {}", e);
+                    if state.started {
+                        if state.content_block_open {
+                            let event = axum::response::sse::Event::default()
+                                .data(format_sse(&AnthropicSSEEvent::ContentBlockStop {
+                                    index: state.content_index,
+                                }));
+                            let _ = tx.send(Ok(event)).await;
+                        }
+                        let event = axum::response::sse::Event::default()
+                            .data(format_sse(&AnthropicSSEEvent::MessageDelta {
+                                delta: MessageDeltaData {
+                                    stop_reason: "error".to_string(),
+                                    stop_sequence: None,
+                                },
+                                usage: OutputUsage { output_tokens: 0 },
+                            }));
+                        let _ = tx.send(Ok(event)).await;
+                        let event = axum::response::sse::Event::default()
+                            .data(format_sse(&AnthropicSSEEvent::MessageStop));
+                        let _ = tx.send(Ok(event)).await;
+                    }
                     return;
                 }
             }
@@ -245,6 +268,7 @@ pub async fn openai_passthrough_handler(
                     }
                     Err(e) => {
                         tracing::error!("[/v1/chat/completions SSE] stream error: {}", e);
+                        let _ = tx.send(Ok(axum::body::Bytes::from("data: [DONE]\n\n"))).await;
                         return;
                     }
                 }
@@ -1114,5 +1138,146 @@ mod tests {
                 .unwrap()
                 .contains("Backend failed")
         );
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_handler_stream_backend_disconnect_emits_error_event() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = socket.into_split();
+
+            let mut buf = vec![0u8; 4096];
+            let _ = reader.read(&mut buf).await;
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            writer.write_all(response).await.unwrap();
+
+            let chunk1 = b"10a\r\ndata: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1731610419,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\r\n";
+            writer.write_all(chunk1).await.unwrap();
+            writer.flush().await.unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(writer);
+        });
+
+        let backend_url = format!("http://{}", addr);
+
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: backend_url,
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/v1/messages", post(anthropic_proxy_handler))
+            .with_state(state);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": "qwen35-397b",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1024,
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        let body = res.text().await.unwrap();
+
+        assert!(body.contains("event: message_start"), "should have message_start");
+        assert!(body.contains("event: message_delta"), "should have message_delta with stop_reason on stream error");
+        assert!(body.contains("event: message_stop"), "should have message_stop on stream error");
+    }
+
+    #[tokio::test]
+    async fn openai_passthrough_handler_stream_backend_disconnect_sends_error_chunk() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = socket.into_split();
+
+            let mut buf = vec![0u8; 4096];
+            let _ = reader.read(&mut buf).await;
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            writer.write_all(response).await.unwrap();
+
+            let chunk1 = b"67\r\ndata: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1731610419,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\r\n";
+            writer.write_all(chunk1).await.unwrap();
+            writer.flush().await.unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(writer);
+        });
+
+        let backend_url = format!("http://{}", addr);
+
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: backend_url,
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/v1/chat/completions", post(openai_passthrough_handler))
+            .with_state(state);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&json!({
+                "model": "qwen35-397b",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        let body = res.text().await.unwrap();
+
+        assert!(body.contains("data:"), "should have SSE data");
+        assert!(body.contains("error") || body.contains("[DONE]"), "should signal error or completion on stream disconnect");
     }
 }
