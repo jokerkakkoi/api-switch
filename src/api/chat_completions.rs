@@ -93,7 +93,10 @@ pub async fn openai_passthrough_handler(
         });
 
         let body = axum::body::Body::from_stream(ReceiverStream::new(rx));
-        let mut resp = Response::builder().status(status).body(body)?;
+        let mut resp = Response::builder()
+            .status(status)
+            .body(body)
+            .map_err(AppError::from)?;
         *resp.headers_mut() = resp_headers;
         Ok(resp)
     } else {
@@ -108,7 +111,8 @@ pub async fn openai_passthrough_handler(
         }
         let mut resp = Response::builder()
             .status(status)
-            .body(axum::body::Body::from(body_bytes))?;
+            .body(axum::body::Body::from(body_bytes))
+            .map_err(AppError::from)?;
         *resp.headers_mut() = resp_headers;
         tracing::info!("OpenAI request completed (non-streaming)");
         Ok(resp)
@@ -125,9 +129,8 @@ mod tests {
     use std::sync::Arc;
     use tokio::net::TcpListener;
 
-    use crate::config::{AppConfig, ModelConfig};
-
     use super::AppState;
+    use crate::config::{AppConfig, ModelConfig};
 
     fn make_test_config(backend_url: String) -> Arc<AppConfig> {
         Arc::new(AppConfig {
