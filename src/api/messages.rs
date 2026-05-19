@@ -176,3 +176,434 @@ async fn handle_stream_response(
     let stream = ReceiverStream::new(rx);
     Ok(Sse::new(stream).into_response())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::anthropic_proxy_handler;
+    use axum::{Router, routing::post};
+    use axum::http::HeaderMap;
+    use reqwest::Client;
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    use crate::config::{AppConfig, ModelConfig};
+    use crate::handler::AppState;
+
+    fn make_test_config(backend_url: String) -> Arc<AppConfig> {
+        Arc::new(AppConfig {
+            models: vec![
+                ModelConfig {
+                    name: "qwen35-397b".into(),
+                    app_key: "test-key".into(),
+                    app_sign: "test-sign".into(),
+                    base_url: backend_url.clone(),
+                },
+                ModelConfig {
+                    name: "glm-5".into(),
+                    app_key: "test-key-2".into(),
+                    app_sign: "test-sign-2".into(),
+                    base_url: backend_url.clone(),
+                },
+            ],
+            port: 0,
+        })
+    }
+
+    async fn start_mock_backend_for_sse() -> String {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|_headers: HeaderMap, _body: String| async move {
+                let stream = futures::stream::iter(vec![
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                        "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1731610419,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+                    )),
+                    Ok(axum::body::Bytes::from(
+                        "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1731610419,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n",
+                    )),
+                    Ok(axum::body::Bytes::from(
+                        "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1731610419,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    )),
+                    Ok(axum::body::Bytes::from("data: [DONE]\n\n")),
+                ]);
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(stream),
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    #[tokio::test]
+    async fn test_messages_streaming_returns_sse_events() {
+        let backend_url = start_mock_backend_for_sse().await;
+        let config = make_test_config(backend_url);
+
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+
+        let app = Router::new()
+            .route("/v1/messages", post(anthropic_proxy_handler))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let req_body = json!({
+            "model": "qwen35-397b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1024,
+            "stream": true
+        });
+
+        let res = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", "2023-06-01")
+            .json(&req_body)
+            .send()
+            .await
+            .expect("Request failed");
+
+        assert_eq!(res.status(), 200);
+        assert!(
+            res.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("text/event-stream")
+        );
+
+        let body = res.text().await.expect("Failed to read response body");
+        assert!(body.contains("event: message_start"));
+        assert!(body.contains("event: content_block_start"));
+        assert!(body.contains("event: content_block_delta"));
+        assert!(body.contains("event: content_block_stop"));
+        assert!(body.contains("event: message_delta"));
+        assert!(body.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_handler_unknown_model_returns_400() {
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: "http://localhost".into(),
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/v1/messages", post(anthropic_proxy_handler))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": "unknown-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 400);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Unknown model: unknown-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_handler_known_model_forwards_with_correct_credentials() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|headers: HeaderMap, _body: String| async move {
+                assert_eq!(
+                    headers.get("app-key").unwrap().to_str().unwrap(),
+                    "model-specific-key"
+                );
+                assert_eq!(
+                    headers.get("app-sign").unwrap().to_str().unwrap(),
+                    "model-specific-sign"
+                );
+                let resp = json!({
+                    "id": "msg_123",
+                    "object": "chat.completion",
+                    "created": 1731610419,
+                    "model": "qwen35-397b",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                });
+                axum::Json(resp)
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend_url = format!("http://{}", addr);
+
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "model-specific-key".into(),
+                app_sign: "model-specific-sign".into(),
+                base_url: backend_url.clone(),
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/v1/messages", post(anthropic_proxy_handler))
+            .with_state(state);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": "qwen35-397b",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_handler_invalid_json_returns_400() {
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: "http://localhost".into(),
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/v1/messages", post(anthropic_proxy_handler))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", "2023-06-01")
+            .body("not valid json {{{")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 400);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid request body")
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_handler_backend_error_returns_error() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|_headers: HeaderMap, _body: String| async move {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":{"message":"Backend failed","type":"server_error"}}"#,
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend_url = format!("http://{}", addr);
+
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: backend_url,
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/v1/messages", post(anthropic_proxy_handler))
+            .with_state(state);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": "qwen35-397b",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 502);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Backend failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_handler_stream_backend_disconnect_emits_error_event() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = socket.into_split();
+
+            let mut buf = vec![0u8; 4096];
+            let _ = reader.read(&mut buf).await;
+
+            let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            writer.write_all(response).await.unwrap();
+
+            let chunk1 = b"10a\r\ndata: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1731610419,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n\r\n";
+            writer.write_all(chunk1).await.unwrap();
+            writer.flush().await.unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(writer);
+        });
+
+        let backend_url = format!("http://{}", addr);
+
+        let config = Arc::new(AppConfig {
+            models: vec![ModelConfig {
+                name: "qwen35-397b".into(),
+                app_key: "key".into(),
+                app_sign: "sign".into(),
+                base_url: backend_url,
+            }],
+            port: 0,
+        });
+        let state = AppState {
+            config,
+            client: Client::new(),
+        };
+        let app = Router::new()
+            .route("/v1/messages", post(anthropic_proxy_handler))
+            .with_state(state);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(proxy_listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/v1/messages", proxy_addr))
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": "qwen35-397b",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1024,
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        let body = res.text().await.unwrap();
+
+        assert!(
+            body.contains("event: message_start"),
+            "should have message_start"
+        );
+        assert!(
+            body.contains("event: message_delta"),
+            "should have message_delta with stop_reason on stream error"
+        );
+        assert!(
+            body.contains("event: message_stop"),
+            "should have message_stop on stream error"
+        );
+    }
+}
