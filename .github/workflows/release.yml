@@ -67,7 +67,7 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} dist/
           cp config.yaml.example dist/
-          cp HOWTOUSE.md dist/README.md
+          cp docs/HOWTOUSE.md dist/README.md
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

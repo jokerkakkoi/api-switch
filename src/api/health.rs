@@ -4,7 +4,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 use crate::error::AppError;
-use crate::handler::AppState;
+
+use super::AppState;
 
 #[derive(Serialize)]
 pub struct HealthResponse {

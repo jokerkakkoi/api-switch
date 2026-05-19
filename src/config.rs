@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::env;
 
+use crate::error::AppError;
+
 fn default_port() -> u16 {
     3000
 }
@@ -23,6 +25,11 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn find_model(&self, name: &str) -> Option<&ModelConfig> {
         self.models.iter().find(|m| m.name == name)
+    }
+
+    pub fn require_model(&self, name: &str) -> Result<&ModelConfig, AppError> {
+        self.find_model(name)
+            .ok_or_else(|| AppError::InvalidRequestError(format!("Unknown model: {}", name)))
     }
 }
 
