@@ -6,8 +6,9 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::AppError;
-use crate::handler::{AppState, resolve_model};
 use crate::transform::headers::build_forwarded_headers;
+
+use super::AppState;
 
 const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 
@@ -27,7 +28,7 @@ pub async fn openai_passthrough_handler(
             AppError::InvalidRequestError("Missing 'model' field in request".to_string())
         })?;
 
-    let model = resolve_model(&state, model_name)?;
+    let model = state.config.require_model(model_name)?;
 
     let mut fwd_headers = build_forwarded_headers(&headers, &model.app_key, &model.app_sign)?;
     fwd_headers.insert(
@@ -117,15 +118,16 @@ pub async fn openai_passthrough_handler(
 #[cfg(test)]
 mod tests {
     use super::openai_passthrough_handler;
-    use axum::{Router, routing::post};
     use axum::http::HeaderMap;
+    use axum::{Router, routing::post};
     use reqwest::Client;
     use serde_json::json;
     use std::sync::Arc;
     use tokio::net::TcpListener;
 
     use crate::config::{AppConfig, ModelConfig};
-    use crate::handler::AppState;
+
+    use super::AppState;
 
     fn make_test_config(backend_url: String) -> Arc<AppConfig> {
         Arc::new(AppConfig {

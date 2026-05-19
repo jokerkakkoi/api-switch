@@ -2,12 +2,11 @@ mod anthropic;
 mod api;
 mod config;
 mod error;
-mod handler;
 mod openai;
 mod transform;
 
+use api::AppState;
 use axum::{Router, routing::get, routing::post};
-use handler::AppState;
 use std::sync::Arc;
 
 #[tokio::main]

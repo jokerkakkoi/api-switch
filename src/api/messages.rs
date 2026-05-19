@@ -10,12 +10,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::anthropic::{AnthropicRequest, AnthropicSSEEvent};
 use crate::anthropic::{MessageDeltaData, OutputUsage};
 use crate::error::AppError;
-use crate::handler::{AppState, resolve_model};
 use crate::openai::OpenAISSEChunk;
 use crate::transform::headers::build_forwarded_headers;
 use crate::transform::request::convert_request;
 use crate::transform::response::{convert_response, map_openai_error};
 use crate::transform::stream::{StreamState, convert_stream_chunk, format_sse};
+
+use super::AppState;
 
 const OPENAI_CHAT_PATH: &str = "/v1/chat/completions";
 
@@ -28,7 +29,7 @@ pub async fn anthropic_proxy_handler(
     let anthropic_req: AnthropicRequest = serde_json::from_str(&body)
         .map_err(|e| AppError::InvalidRequestError(format!("Invalid request body: {}", e)))?;
 
-    let model = resolve_model(&state, &anthropic_req.model)?;
+    let model = state.config.require_model(&anthropic_req.model)?;
     let is_stream = anthropic_req.stream;
 
     let openai_req = convert_request(anthropic_req);
@@ -180,15 +181,16 @@ async fn handle_stream_response(
 #[cfg(test)]
 mod tests {
     use super::anthropic_proxy_handler;
-    use axum::{Router, routing::post};
     use axum::http::HeaderMap;
+    use axum::{Router, routing::post};
     use reqwest::Client;
     use serde_json::json;
     use std::sync::Arc;
     use tokio::net::TcpListener;
 
     use crate::config::{AppConfig, ModelConfig};
-    use crate::handler::AppState;
+
+    use super::AppState;
 
     fn make_test_config(backend_url: String) -> Arc<AppConfig> {
         Arc::new(AppConfig {
