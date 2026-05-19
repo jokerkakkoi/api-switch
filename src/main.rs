@@ -2,12 +2,11 @@ mod anthropic;
 mod api;
 mod config;
 mod error;
-mod handler;
 mod openai;
 mod transform;
 
+use api::AppState;
 use axum::{Router, routing::get, routing::post};
-use handler::AppState;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -25,10 +24,10 @@ async fn main() {
     let state = AppState { config, client };
 
     let app = Router::new()
-        .route("/v1/messages", post(handler::anthropic_proxy_handler))
+        .route("/v1/messages", post(api::messages::anthropic_proxy_handler))
         .route(
             "/v1/chat/completions",
-            post(handler::openai_passthrough_handler),
+            post(api::chat_completions::openai_passthrough_handler),
         )
         .route("/health", get(api::health::health_handler))
         .with_state(state);

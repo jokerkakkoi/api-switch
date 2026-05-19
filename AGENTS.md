@@ -52,7 +52,11 @@ Anthropic → OpenAI protocol conversion gateway (axum HTTP server).
 src/main.rs           → Entry, route registration, port from config, 300s client timeout
 src/config.rs         → Multi-model AppConfig (Vec<ModelConfig>, port), find_model() lookup
 src/error.rs          → AppError enum (5 variants), Anthropic-format error responses
-src/handler.rs        → Route handlers, AppState, model resolution, SSE streaming
+src/api/
+  ├── mod.rs          → API module entry, route handler exports
+  ├── messages.rs     → Anthropic → OpenAI proxy (protocol conversion)
+  ├── chat_completions.rs → OpenAI passthrough (transparent proxy)
+  └── health.rs       → Health check (proxies to first model's backend)
 src/anthropic/mod.rs  → Anthropic protocol types (request, response, SSE events, tools)
 src/openai/mod.rs     → OpenAI protocol types (request, response, SSE chunks, tools)
 src/transform/
