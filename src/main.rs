@@ -25,7 +25,7 @@ async fn main() {
     let state = AppState { config, client };
 
     let app = Router::new()
-        .route("/v1/messages", post(handler::anthropic_proxy_handler))
+        .route("/v1/messages", post(api::messages::anthropic_proxy_handler))
         .route(
             "/v1/chat/completions",
             post(handler::openai_passthrough_handler),

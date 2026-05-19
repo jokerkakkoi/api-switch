@@ -27,7 +27,7 @@ pub struct AppState {
     pub client: Client,
 }
 
-fn resolve_model<'a>(state: &'a AppState, model_name: &str) -> Result<&'a ModelConfig, AppError> {
+pub fn resolve_model<'a>(state: &'a AppState, model_name: &str) -> Result<&'a ModelConfig, AppError> {
     state
         .config
         .find_model(model_name)
