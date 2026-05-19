@@ -28,7 +28,7 @@ async fn main() {
         .route("/v1/messages", post(api::messages::anthropic_proxy_handler))
         .route(
             "/v1/chat/completions",
-            post(handler::openai_passthrough_handler),
+            post(api::chat_completions::openai_passthrough_handler),
         )
         .route("/health", get(api::health::health_handler))
         .with_state(state);
